@@ -94,7 +94,7 @@ DEFAULT_CONFIG = {
         "background": "transparent",
         "background_alpha": 255,
         "corner_radius": 6,
-        "stale_opacity": 0.55,
+        "stale_opacity": 0.7,
         "supersample": 3,
     },
     "left_click": "flyout",
@@ -173,6 +173,16 @@ def hex_to_rgba(value, alpha=255):
     if len(v) == 8:
         return (int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16), int(v[6:8], 16))
     return (int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16), alpha)
+
+
+def shade(color, factor):
+    """Lighten (factor > 0) or darken (factor < 0) a colour, keeping its hue."""
+    r, g, b = hex_to_rgba(color)[:3]
+    if factor >= 0:
+        r, g, b = (int(c + (255 - c) * factor) for c in (r, g, b))
+    else:
+        r, g, b = (int(c * (1 + factor)) for c in (r, g, b))
+    return "#%02X%02X%02X" % (max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b)))
 
 
 def color_for(pct, thresholds):
@@ -1247,29 +1257,40 @@ class Flyout(object):
         self._cached_family = "Segoe UI"
         return self._cached_family
 
-    def severity_color(self, pct, colors):
-        """Rank the configured thresholds, then paint with the Fluent colour for
-        that rank so the flyout stays legible in both themes."""
-        ranks = sorted(self.app.cfg["thresholds"], key=lambda t: float(t.get("at", 0)))
-        index = 0
-        for i, threshold in enumerate(ranks):
-            if pct >= float(threshold.get("at", 0)):
-                index = i
-        return [colors["good"], colors["caution"], colors["critical"]][min(index, 2)]
+    def severity_color(self, pct):
+        """The same vivid colour the widget uses, straight from `thresholds`."""
+        return color_for(pct, self.app.cfg["thresholds"])
+
+    def text_color_for(self, pct, light):
+        """The bar can be vivid; the percentage beside it is small text, so on a
+        light surface it needs deepening to stay readable (amber especially)."""
+        color = self.severity_color(pct)
+        return shade(color, -0.28) if light else shade(color, 0.08)
 
     # -- drawn pieces ------------------------------------------------------
     def _bar(self, width, pct, color, colors):
-        h = self.px(6)
+        """A filled bar with a gradient along it - flat colour at this size reads
+        as a grey-ish slab, the gradient is what makes it look lit."""
+        h = self.px(8)
         ss = 4
-        img = Image.new("RGBA", (width * ss, h * ss), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        radius = h * ss / 2.0
-        d.rounded_rectangle((0, 0, width * ss - 1, h * ss - 1), radius=radius,
-                            fill=hex_to_rgba(colors["track"]))
-        span = (width * ss - 1) * max(0.0, min(100.0, pct)) / 100.0
+        W, H = width * ss, h * ss
+        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        radius = H / 2.0
+        ImageDraw.Draw(img).rounded_rectangle((0, 0, W - 1, H - 1), radius=radius,
+                                              fill=hex_to_rgba(colors["track"]))
+        span = int((W - 1) * max(0.0, min(100.0, pct)) / 100.0)
         if span > 0:
-            d.rounded_rectangle((0, 0, max(span, h * ss), h * ss - 1), radius=radius,
-                                fill=hex_to_rgba(color))
+            span = max(span, int(H))
+            start, end = hex_to_rgba(shade(color, 0.28)), hex_to_rgba(color)
+            fill = Image.new("RGBA", (span, H))
+            paint = ImageDraw.Draw(fill)
+            for x in range(span):
+                t = x / float(max(1, span - 1))
+                paint.line([(x, 0), (x, H)],
+                           fill=tuple(int(start[i] + (end[i] - start[i]) * t) for i in range(4)))
+            mask = Image.new("L", (span, H), 0)
+            ImageDraw.Draw(mask).rounded_rectangle((0, 0, span - 1, H - 1), radius=radius, fill=255)
+            img.paste(fill, (0, 0), mask)
         photo = ImageTk.PhotoImage(img.resize((width, h), Image.LANCZOS))
         self._images.append(photo)
         return photo
@@ -1378,13 +1399,15 @@ class Flyout(object):
                     datetime.fromtimestamp(self.app.retry_at, timezone.utc))
             label(note, text, size=12, color=colors["caution"], anchor="w", fill="x")
 
+        light = colors is FLUENT["light"]
         for lim in usage.limits:
             pct = float(lim["percent"])
-            color = self.severity_color(pct, colors)
+            color = self.severity_color(pct)
             row = tk.Frame(self.body, bg=colors["surface"])
             row.pack(fill="x", pady=(self.px(14), 0))
             label(row, lim["label"], size=13, side="left")
-            label(row, "%d%%" % round(pct), size=13, weight="bold", color=color, side="right")
+            label(row, "%d%%" % round(pct), size=13, weight="bold",
+                  color=self.text_color_for(pct, light), side="right")
 
             bar = tk.Label(self.body, image=self._bar(content, pct, color, colors),
                            bd=0, highlightthickness=0, bg=colors["surface"])
@@ -1972,9 +1995,11 @@ class TaskbarWidget(object):
         error = None if limit else (short_error(usage.error) or "no data")
         # Numbers that stopped being refreshed still deserve to be trusted less:
         # dim them rather than pretend they are live.
+        # Dimming is about age, not about whether the last poll failed: the
+        # endpoint rate-limits often, and a figure from a minute ago is still
+        # worth showing at full strength. The flyout explains the error.
         age = usage.age_seconds()
-        stale = bool(usage.error) or (
-            age is not None and age > max(300.0, 3.0 * float(self.app.cfg["refresh_seconds"])))
+        stale = age is None or age > max(300.0, 3.0 * float(self.app.cfg["refresh_seconds"]))
         state = (round(pct, 1), human_delta(reset), error, stale, self.geometry,
                  windows_uses_light_theme())
         if state == self._last_key:

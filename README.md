@@ -153,7 +153,7 @@ rebuilds, backing off if the shell is not back yet.
 | `text_color` / `muted_color` | `auto` follows the Windows theme. |
 | `show_bar`, `bar_height` | The progress bar under the countdown. |
 | `show_reset` | The reset countdown. Drop it to save width. |
-| `stale_opacity` | Opacity for numbers that stopped being refreshed - rate limited, offline, signed out (default 0.55). |
+| `stale_opacity` | Opacity for numbers that have stopped being refreshed (default 0.7). Judged by age, not by whether the last poll failed - the endpoint rate-limits often and a figure from a minute ago is still worth showing at full strength. |
 | `supersample` | Render scale for the text; 3 is plenty. |
 
 Severity colours are the ones in `thresholds` (vivid green, amber and red by
@@ -326,8 +326,9 @@ success / caution / critical colours.
   kills its chain silently, and under `pythonw` the traceback goes nowhere - one
   unguarded exception used to be enough to stop polling, clicks or config reload
   while the app kept running and looking healthy.
-* Numbers that stopped being refreshed are dimmed rather than shown as if live,
-  and the on-disk cache is ignored once it is more than 12 hours old.
+* Numbers are dimmed once they stop being refreshed for real (older than five
+  minutes, or three polls, whichever is longer) rather than on the first failed
+  poll, and the on-disk cache is ignored once it is more than 12 hours old.
 * There is no fullscreen detection any more: as a child of the taskbar the widget
   is hidden by exactly what hides the taskbar, so there is nothing to detect.
 * `/api/oauth/usage` is the endpoint Claude Code's own `/usage` uses. It is not a

@@ -92,6 +92,7 @@
     "supersample": 3,
     "background": "transparent",
     "corner_radius": 6,
-    "background_alpha": 255
+    "background_alpha": 255,
+    "stale_opacity": 0.7
   }
 }
