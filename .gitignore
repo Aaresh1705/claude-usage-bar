@@ -1,0 +1,4 @@
+.icons/
+__pycache__/
+*.pyc
+claude_usage_bar.log
