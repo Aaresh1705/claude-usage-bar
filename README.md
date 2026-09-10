@@ -118,23 +118,28 @@ you can keep a minimal file with just your overrides.
 
 ### `taskbar_widget`
 
-The overlay. It is a **layered window**: `UpdateLayeredWindow` hands DWM a bitmap
-with per-pixel alpha, so nothing paints a background at all — the real taskbar,
-with its acrylic tint and the gradient it picks up from your wallpaper, simply
-shows through. That is a deliberate change from the first version, which sampled
-the taskbar's colour with `GetPixel` and filled a rectangle with it: the taskbar
-is not one colour (measured here: it varies by ~7 RGB levels across its own
-width), so a flat fill can only ever match at the point it was sampled.
+The overlay. It is a **layered window owned by the taskbar**, and both halves of
+that matter.
 
-Two more consequences of the layered window: updates arrive as one composited
-frame, which is why it no longer flickers, and the whole rectangle is painted at
-alpha 1 — invisible, but enough for `UpdateLayeredWindow`'s alpha hit-testing to
-route clicks to the widget rather than through it.
+*Layered* (`UpdateLayeredWindow`, per-pixel alpha) means nothing paints a
+background at all - the real taskbar, with its acrylic tint and the gradient it
+picks up from your wallpaper, shows through. The first version sampled the
+taskbar's colour with `GetPixel` and filled a rectangle with it, which can only
+ever match at the point it was sampled: measured here, the taskbar varies by
+about 7 RGB levels across its own width. Updates also arrive as one composited
+frame, so it does not flicker on redraw.
 
-Z-order is held by answering `WM_WINDOWPOSCHANGING` (forcing `hwndInsertAfter`
-back to `HWND_TOPMOST`) instead of calling `SetWindowPos` on a half-second timer.
-The timer version was what made the widget blink when a menu opened or a program
-launched. A `SetWindowPos` remains as a safety net, every ten seconds.
+*Owned by the taskbar* is what keeps it in place. A plain topmost window loses
+its position the moment you click the taskbar - measured: demoted below it within
+5ms, and blank for about 300ms until something noticed - and it is hidden
+entirely while the Start menu is open. Windows keeps an **owned** window in front
+of its owner, so both problems disappear at the source: measured 0 blank frames
+across four taskbar clicks, and the widget stays visible with Start open. It
+costs nothing to maintain - no z-order polling, no timers fighting the shell -
+and the widget still receives its own clicks.
+
+The trade-off is that an owned window dies with its owner, so an Explorer restart
+takes the widget with it; the tick notices within half a second and rebuilds it.
 
 | Key | Meaning |
 | --- | --- |
@@ -164,19 +169,11 @@ signal that also holds back system toasts) and additionally compares the
 foreground window to its monitor — and only to *our* monitor, so a video playing
 full-screen on a second display no longer blanks the overlay on the first.
 
-**When it goes away on purpose.** The Start menu, Search and Task View are shell
-surfaces that Windows composites above every ordinary window, topmost or not, so
-the overlay is hidden while one of them is open and returns when it closes
-(measured: back within 0.35-0.8s). The taskbar stays visible underneath them,
-which makes it look as though only the widget vanished. Nothing an app without
-UIAccess can do about that - and drawing on top of the Start menu would be the
-wrong behaviour anyway. Ordinary interactions do *not* hide it: clicking an empty
-part of the taskbar, the desktop, another window, the notification centre, quick
-settings, or this app's own menu and flyout all leave it in place.
-
-If the widget ever does end up behind the taskbar in the window z-order, a
-read-only check each tick notices and puts it back within half a second, rather
-than waiting for the ten-second safety re-assert.
+**What still covers it.** Task View (Win+Tab) draws above everything and hides
+the widget while it is open; it returns when you leave. The Start menu, Search,
+the notification centre and quick settings do not, thanks to the ownership above.
+Neither does anything ordinary: clicking the taskbar, the desktop, another
+window, or this app's own menu and flyout.
 
 **Limits worth knowing.** With the taskbar centred, the left corner is free until
 you have a lot of windows open — Windows will happily slide app buttons under the

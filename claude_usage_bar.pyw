@@ -1012,6 +1012,8 @@ class TrayApp(object):
         threading.Thread(target=worker, daemon=True).start()
 
     def apply_pending(self):
+        if self._pending is None:        # cheap check on the hot pump path
+            return
         with self._lock:
             result, self._pending = self._pending, None
         if result is None:
@@ -1575,6 +1577,7 @@ user32.GetWindow.restype = wt.HWND
 user32.GetWindow.argtypes = [wt.HWND, wt.UINT]
 user32.GetTopWindow.restype = wt.HWND
 user32.GetTopWindow.argtypes = [wt.HWND]
+user32.IsWindow.argtypes = [wt.HWND]
 user32.MonitorFromWindow.restype = wt.HANDLE
 user32.MonitorFromWindow.argtypes = [wt.HWND, wt.DWORD]
 user32.MonitorFromPoint.restype = wt.HANDLE
@@ -1746,6 +1749,9 @@ class TaskbarWidget(object):
         self._last_blit_error = None
         self._busy_until = 0.0
         self._reassert = 0
+        self.owner = None
+        self._last_foreground = None
+        self._last_busy = (False, False)
         self._create()
 
     # -- window ------------------------------------------------------------
@@ -1779,14 +1785,21 @@ class TaskbarWidget(object):
             wc.hInstance = kernel32.GetModuleHandleW(None)
             wc.lpszClassName = self.CLASS_NAME
             TaskbarWidget._atom = user32.RegisterClassW(ctypes.byref(wc))
+        # Owned by the taskbar. Windows keeps an owned window in front of its
+        # owner, so clicking the taskbar can no longer bury us (that was a
+        # ~300ms blink) and we stay visible even while the Start menu is up,
+        # because we ride in the taskbar's own place in the z-order. It also
+        # means no z-order polling at all.
+        self.owner = user32.FindWindowW("Shell_TrayWnd", None)
         self.hwnd = user32.CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
             self.CLASS_NAME, "Claude usage", WS_POPUP, 0, 0, 10, 10,
-            None, None, kernel32.GetModuleHandleW(None), None)
+            self.owner, None, kernel32.GetModuleHandleW(None), None)
         if not self.hwnd:
             log("overlay window creation failed: %s" % ctypes.get_last_error())
             return
         TaskbarWidget._windows[int(self.hwnd)] = self
+
 
     def _on_message(self, msg, wparam, lparam):
         """Return None for anything we don't handle."""
@@ -1902,9 +1915,9 @@ class TaskbarWidget(object):
             user32.ReleaseDC(None, screen)
 
     # -- placement ---------------------------------------------------------
-    def _target_geometry(self):
+    def _target_geometry(self, info=None):
         """Where to sit, or None when the taskbar is hidden or not horizontal."""
-        info = taskbar_info()
+        info = info or taskbar_info()
         if info is None:
             return None
         rect, edge, autohide = info
@@ -1934,14 +1947,32 @@ class TaskbarWidget(object):
         return x, y, w, h
 
     def tick(self):
-        """Called twice a second: placement, visibility, and a safety net."""
+        """Called twice a second: placement and visibility."""
+        if self.hwnd and not user32.IsWindow(self.hwnd):
+            # Explorer restarted: destroying the taskbar destroys what it owns.
+            log("overlay window went away with the taskbar; rebuilding")
+            TaskbarWidget._windows.pop(int(self.hwnd), None)
+            self.hwnd = None
+            self.shown = False
+            self._release_dc()
+            self._create()
+            self._last_key = None
+            self.geometry = None
+        if not self.hwnd:
+            return
         c = self.cfg()
         info = taskbar_info()
         taskbar_rect = info[0] if info else None
 
         if bool(c.get("hide_on_fullscreen", True)):
-            busy = user_is_busy()
-            fullscreen = foreground_is_fullscreen(taskbar_rect)
+            # Both questions are about the foreground window; while that hasn't
+            # changed, the previous answer still holds.
+            foreground = user32.GetForegroundWindow()
+            if foreground == self._last_foreground:
+                busy, fullscreen = self._last_busy
+            else:
+                busy, fullscreen = user_is_busy(), foreground_is_fullscreen(taskbar_rect)
+                self._last_foreground, self._last_busy = foreground, (busy, fullscreen)
             if busy or fullscreen:
                 self._busy_until = time.time() + float(c.get("fullscreen_grace_ms", 900)) / 1000.0
                 self._hide("busy" if busy else "fullscreen")
@@ -1951,7 +1982,7 @@ class TaskbarWidget(object):
             # Coming back instantly makes us the only thing on screen.
             return
 
-        geometry = self._target_geometry()
+        geometry = self._target_geometry(info)
         if geometry is None:
             self._hide("no taskbar")
             return
@@ -1963,12 +1994,9 @@ class TaskbarWidget(object):
         self._show()
 
         self._reassert = (self._reassert + 1) % 20
-        if self.hwnd and (not self._above_taskbar() or self._reassert == 0):
-            # Clicking the taskbar raises it to the top of the topmost band,
-            # which buries us under it: same rect, still "visible", nothing on
-            # screen. WM_WINDOWPOSCHANGING never fires for that - our own
-            # position doesn't change - so the z-order is checked here instead.
-            # The check is read-only, so the common case still costs no repaint.
+        if self.hwnd and self._reassert == 0 and not self._above_taskbar():
+            # Ownership does the work; this is only a backstop for a shell that
+            # has reshuffled everything behind our back.
             user32.SetWindowPos(self.hwnd, wt.HWND(HWND_TOPMOST), 0, 0, 0, 0,
                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
 
@@ -2364,16 +2392,22 @@ def main():
             root.after(interval_ms, run)
         root.after(interval_ms if first_ms is None else first_ms, run)
 
+    pump_count = [0]
+
     def pump():
         while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
         app.apply_pending()
+        # Riding the pump rather than a timer of its own: one Tk callback less
+        # per cycle, and the z-order still gets checked every ~75ms, which is
+        # what keeps a taskbar click from blinking the widget.
+        pump_count[0] += 1
 
     def refetch():
         app.start_fetch()
 
-    every("pump", 40, pump, first_ms=50)
+    every("pump", 50, pump, first_ms=50)
     every("poll", max(10, int(app.cfg["refresh_seconds"])) * 1000, refetch, first_ms=100)
     every("config watch", 2000, lambda: app.reload_config() if app.config_changed_on_disk() else None)
     every("tray icons", 5000, app.ensure_icons)
