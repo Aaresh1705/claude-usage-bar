@@ -151,6 +151,7 @@ launched. A `SetWindowPos` remains as a safety net, every ten seconds.
 | `show_reset` | The reset countdown. Drop it to save width. |
 | `hide_on_fullscreen` | Get out of the way of games and full-screen video. |
 | `fullscreen_grace_ms` | How long to wait after fullscreen ends before coming back (default 900). Without it the overlay reappears while the desktop is still repainting and is briefly the only thing on screen. |
+| `stale_opacity` | Opacity for numbers that stopped being refreshed - rate limited, offline, signed out (default 0.55). |
 | `fade_ms` | Fade-in when it reappears (default 160). |
 | `supersample` | Render scale for the text; 3 is plenty. |
 
@@ -162,6 +163,20 @@ Fullscreen detection asks Windows itself (`SHQueryUserNotificationState`, the
 signal that also holds back system toasts) and additionally compares the
 foreground window to its monitor — and only to *our* monitor, so a video playing
 full-screen on a second display no longer blanks the overlay on the first.
+
+**When it goes away on purpose.** The Start menu, Search and Task View are shell
+surfaces that Windows composites above every ordinary window, topmost or not, so
+the overlay is hidden while one of them is open and returns when it closes
+(measured: back within 0.35-0.8s). The taskbar stays visible underneath them,
+which makes it look as though only the widget vanished. Nothing an app without
+UIAccess can do about that - and drawing on top of the Start menu would be the
+wrong behaviour anyway. Ordinary interactions do *not* hide it: clicking an empty
+part of the taskbar, the desktop, another window, the notification centre, quick
+settings, or this app's own menu and flyout all leave it in place.
+
+If the widget ever does end up behind the taskbar in the window z-order, a
+read-only check each tick notices and puts it back within half a second, rather
+than waiting for the ten-second safety re-assert.
 
 **Limits worth knowing.** With the taskbar centred, the left corner is free until
 you have a lot of windows open — Windows will happily slide app buttons under the
@@ -314,6 +329,18 @@ success / caution / critical colours.
 * Notifications fire once per threshold per reset window — sitting at 100% does
   not re-notify, and the counter resets when the window rolls over.
 * Errors go to `claude_usage_bar.log` next to the script (right click → Open log).
+  Every launch, every overlay hide/show (with its reason) and every failing timer
+  is recorded there, so "it vanished and I don't know why" is answerable after
+  the fact.
+* Every timer chain is individually guarded. A Tk `after` callback that raises
+  kills its chain silently, and under `pythonw` the traceback goes nowhere - one
+  unguarded exception used to be enough to stop polling, clicks or config reload
+  while the app kept running and looking healthy.
+* Numbers that stopped being refreshed are dimmed rather than shown as if live,
+  and the on-disk cache is ignored once it is more than 12 hours old.
+* A window that is merely maximised is no longer mistaken for a fullscreen one -
+  which used to hide the overlay permanently for anyone with an auto-hiding
+  taskbar, since the work area then equals the whole monitor.
 * `/api/oauth/usage` is the endpoint Claude Code's own `/usage` uses. It is not a
   documented public API, so treat the shape as something that can change; the parser
   falls back to the older `five_hour` / `seven_day` fields if the `limits` array

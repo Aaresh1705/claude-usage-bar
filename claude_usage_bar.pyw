@@ -97,6 +97,7 @@ DEFAULT_CONFIG = {
         "hide_on_fullscreen": True,
         "fullscreen_grace_ms": 900,
         "fade_ms": 160,
+        "stale_opacity": 0.55,
         "supersample": 3,
     },
     "left_click": "flyout",
@@ -200,6 +201,12 @@ LABELS = {
 class Usage(object):
     status = None
     stale = False
+
+    def age_seconds(self):
+        """How old the numbers are, or None when there are none."""
+        if self.updated is None:
+            return None
+        return max(0.0, (datetime.now() - self.updated).total_seconds())
 
     def __init__(self):
         self.limits = []
@@ -321,6 +328,9 @@ def load_usage_cache():
             u.updated = datetime.fromisoformat(blob["updated"])
         if not u.limits:
             return None
+        age = u.age_seconds()
+        if age is None or age > 12 * 3600:
+            return None          # a day-old percentage is not worth showing
         u.stale = True
         return u
     except Exception:
@@ -656,6 +666,10 @@ user32.TrackPopupMenu.restype = ctypes.c_int
 user32.TrackPopupMenu.argtypes = [wt.HMENU, wt.UINT, ctypes.c_int, ctypes.c_int,
                                   ctypes.c_int, wt.HWND, wt.LPVOID]
 user32.AppendMenuW.argtypes = [wt.HMENU, wt.UINT, ctypes.c_void_p, wt.LPCWSTR]
+kernel32.GetModuleHandleW.restype = wt.HMODULE
+kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
+kernel32.WaitForSingleObject.restype = wt.DWORD
+kernel32.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
 kernel32.CreateMutexW.restype = wt.HANDLE
 kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.LPCWSTR]
 user32.FindWindowW.restype = wt.HWND
@@ -1310,11 +1324,23 @@ class Flyout(object):
         self._images = []
 
     def refresh(self, usage):
+        """Only rebuild when something actually changed: a full rebuild drops
+        button hover states and flashes the panel."""
         if not self.visible:
             return
+        key = (usage.error, usage.updated,
+               tuple((l["label"], round(l["percent"], 2), l["resets_at"]) for l in usage.limits))
+        if key == getattr(self, "_content_key", None):
+            return
+        self._content_key = key
         self.render(usage)
+        self.win.update_idletasks()
+        self.win.geometry("%dx%d" % (self.win.winfo_reqwidth(), self.win.winfo_reqheight()))
 
     def render(self, usage):
+        self._content_key = (usage.error, usage.updated,
+                             tuple((l["label"], round(l["percent"], 2), l["resets_at"])
+                                   for l in usage.limits))
         colors = self.theme()
         cfg = self.app.cfg["flyout"] or {}
         self._clear()
@@ -1403,7 +1429,11 @@ class Flyout(object):
             x = rect.left + ox
         else:
             x = rect.right - w - ox
-        y = rect.bottom - h - oy
+        # With the taskbar on top, the work area's bottom is the far side of the
+        # screen from the widget; open next to the widget instead.
+        info = taskbar_info()
+        on_top = info is not None and info[1] == ABE_TOP
+        y = rect.top + oy if on_top else rect.bottom - h - oy
         self.win.geometry("%dx%d+%d+%d" % (w, h, x, y))
 
         self.win.attributes("-alpha", 0.0)
@@ -1449,6 +1479,9 @@ ABM_GETTASKBARPOS = 0x00000005
 ABS_AUTOHIDE = 0x00000001
 ABE_LEFT, ABE_TOP, ABE_RIGHT, ABE_BOTTOM = 0, 1, 2, 3
 GWL_EXSTYLE = -20
+GWL_STYLE = -16
+WS_CAPTION = 0x00C00000
+WS_THICKFRAME = 0x00040000
 WS_POPUP = 0x80000000
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
@@ -1457,6 +1490,7 @@ WS_EX_TOPMOST = 0x00000008
 HWND_TOPMOST = -1
 SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0004, 0x0010
 SW_HIDE, SW_SHOWNOACTIVATE = 0, 4
+GW_HWNDNEXT = 2
 MONITOR_DEFAULTTONEAREST = 2
 ULW_ALPHA = 0x00000002
 AC_SRC_OVER, AC_SRC_ALPHA = 0x00, 0x01
@@ -1537,6 +1571,10 @@ user32.UpdateLayeredWindow.argtypes = [wt.HWND, wt.HDC, ctypes.POINTER(wt.POINT)
 user32.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
                                 ctypes.c_int, ctypes.c_int, wt.UINT]
 user32.GetForegroundWindow.restype = wt.HWND
+user32.GetWindow.restype = wt.HWND
+user32.GetWindow.argtypes = [wt.HWND, wt.UINT]
+user32.GetTopWindow.restype = wt.HWND
+user32.GetTopWindow.argtypes = [wt.HWND]
 user32.MonitorFromWindow.restype = wt.HANDLE
 user32.MonitorFromWindow.argtypes = [wt.HWND, wt.DWORD]
 user32.MonitorFromPoint.restype = wt.HANDLE
@@ -1604,6 +1642,14 @@ def foreground_is_fullscreen(taskbar_rect=None):
               and rect.right >= m.right and rect.bottom >= m.bottom)
     if not covers:
         return False
+    # A merely maximised window covers the monitor too whenever the work area
+    # is the whole monitor - an auto-hiding taskbar, or a second screen without
+    # one. Real fullscreen drops the caption and the resize frame; keeping the
+    # test on the style rather than on the placement also catches the
+    # borderless-fullscreen games that stay SW_SHOWMAXIMIZED.
+    style = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)(hwnd, GWL_STYLE)
+    if style & (WS_CAPTION | WS_THICKFRAME):
+        return False
     if taskbar_rect is not None:
         # Only our own monitor matters.
         centre = wt.POINT(int((taskbar_rect.left + taskbar_rect.right) / 2),
@@ -1652,6 +1698,12 @@ def windows_uses_light_theme():
         return False
 
 
+def fade_image(image, factor):
+    """Scale an image's alpha - used to dim numbers that are no longer live."""
+    r, g, b, a = image.split()
+    return Image.merge("RGBA", (r, g, b, a.point(lambda v: int(v * factor))))
+
+
 def premultiply(image):
     """UpdateLayeredWindow wants premultiplied alpha; Pillow gives us straight."""
     r, g, b, a = image.split()
@@ -1691,6 +1743,7 @@ class TaskbarWidget(object):
         self._image = None
         self._alpha = 255
         self._fading = False
+        self._last_blit_error = None
         self._busy_until = 0.0
         self._reassert = 0
         self._create()
@@ -1829,9 +1882,22 @@ class TaskbarWidget(object):
         if not screen:
             return
         try:
-            user32.UpdateLayeredWindow(self.hwnd, screen, ctypes.byref(dst), ctypes.byref(size),
-                                       self._dc, ctypes.byref(src), 0, ctypes.byref(blend),
-                                       ULW_ALPHA)
+            ctypes.set_last_error(0)
+            ok = user32.UpdateLayeredWindow(self.hwnd, screen, ctypes.byref(dst),
+                                            ctypes.byref(size), self._dc, ctypes.byref(src),
+                                            0, ctypes.byref(blend), ULW_ALPHA)
+            if not ok:
+                # Silently ignoring this is how a blank widget goes unnoticed.
+                err = ctypes.get_last_error()
+                if err != self._last_blit_error:
+                    self._last_blit_error = err
+                    style = getattr(user32, "GetWindowLongPtrW",
+                                    user32.GetWindowLongW)(self.hwnd, GWL_EXSTYLE)
+                    log("UpdateLayeredWindow failed: err=%s exstyle=0x%X layered=%s"
+                        % (err, style & 0xFFFFFFFF, bool(style & WS_EX_LAYERED)))
+                return False
+            self._last_blit_error = None
+            return True
         finally:
             user32.ReleaseDC(None, screen)
 
@@ -1873,11 +1939,13 @@ class TaskbarWidget(object):
         info = taskbar_info()
         taskbar_rect = info[0] if info else None
 
-        if bool(c.get("hide_on_fullscreen", True)) and (
-                user_is_busy() or foreground_is_fullscreen(taskbar_rect)):
-            self._busy_until = time.time() + float(c.get("fullscreen_grace_ms", 900)) / 1000.0
-            self._hide()
-            return
+        if bool(c.get("hide_on_fullscreen", True)):
+            busy = user_is_busy()
+            fullscreen = foreground_is_fullscreen(taskbar_rect)
+            if busy or fullscreen:
+                self._busy_until = time.time() + float(c.get("fullscreen_grace_ms", 900)) / 1000.0
+                self._hide("busy" if busy else "fullscreen")
+                return
         if time.time() < self._busy_until:
             # Leaving fullscreen, the desktop underneath is still repainting.
             # Coming back instantly makes us the only thing on screen.
@@ -1885,7 +1953,7 @@ class TaskbarWidget(object):
 
         geometry = self._target_geometry()
         if geometry is None:
-            self._hide()
+            self._hide("no taskbar")
             return
         moved = geometry != self.geometry
         self.geometry = geometry
@@ -1895,16 +1963,49 @@ class TaskbarWidget(object):
         self._show()
 
         self._reassert = (self._reassert + 1) % 20
-        if self._reassert == 0 and self.hwnd:
-            # WM_WINDOWPOSCHANGING keeps us in place; this is just a belt for
-            # the odd shell restart that reshuffles everything.
+        if self.hwnd and (not self._above_taskbar() or self._reassert == 0):
+            # Clicking the taskbar raises it to the top of the topmost band,
+            # which buries us under it: same rect, still "visible", nothing on
+            # screen. WM_WINDOWPOSCHANGING never fires for that - our own
+            # position doesn't change - so the z-order is checked here instead.
+            # The check is read-only, so the common case still costs no repaint.
             user32.SetWindowPos(self.hwnd, wt.HWND(HWND_TOPMOST), 0, 0, 0, 0,
                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+
+    def _above_taskbar(self):
+        """Whether we are in front of the taskbar in the window z-order.
+
+        Walks the whole chain once and compares positions. Anything unexpected -
+        the taskbar missing from the chain (Start and Task View take it out of
+        the enumeration while they are up), our own window missing, a runaway
+        chain - answers True: a false alarm here would re-assert the z-order on
+        every tick, which is the flicker this design exists to avoid.
+        """
+        taskbar = user32.FindWindowW("Shell_TrayWnd", None)
+        if not taskbar or not self.hwnd:
+            return True
+        ours, theirs = None, None
+        hwnd = user32.GetTopWindow(None)
+        for index in range(600):
+            if not hwnd:
+                break
+            value = int(hwnd)
+            if value == int(self.hwnd):
+                ours = index
+            elif value == int(taskbar):
+                theirs = index
+            if ours is not None and theirs is not None:
+                break
+            hwnd = user32.GetWindow(hwnd, GW_HWNDNEXT)
+        if ours is None or theirs is None:
+            return True
+        return ours < theirs
 
     def _show(self):
         if self.shown or not self.hwnd:
             return
         self.shown = True
+        log("overlay shown")
         self.app.flyout_anchor = str(self.cfg().get("corner", "left"))
         user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
         fade = int(self.cfg().get("fade_ms", 160) or 0)
@@ -1921,22 +2022,28 @@ class TaskbarWidget(object):
         steps = max(1, int(duration_ms / 16))
 
         def step(i):
-            if not self.shown or self._image is None:
+            try:
+                if not self.shown or self._image is None:
+                    self._fading = False
+                    return
+                self._alpha = int(255 * min(1.0, (i + 1) / float(steps)))
+                self._blit(self._image, self._alpha)
+                if i + 1 < steps:
+                    root.after(16, lambda: step(i + 1))
+                else:
+                    self._fading = False
+            except Exception:
+                log("overlay fade failed: %s" % traceback.format_exc())
                 self._fading = False
-                return
-            self._alpha = int(255 * min(1.0, (i + 1) / float(steps)))
-            self._blit(self._image, self._alpha)
-            if i + 1 < steps:
-                root.after(16, lambda: step(i + 1))
-            else:
-                self._fading = False
+                self._alpha = 255
 
         step(0)
 
-    def _hide(self):
+    def _hide(self, reason="hidden"):
         if not self.shown:
             return
         self.shown = False
+        log("overlay hidden (%s)" % reason)
         if self.hwnd:
             user32.ShowWindow(self.hwnd, SW_HIDE)
 
@@ -1974,8 +2081,14 @@ class TaskbarWidget(object):
         pct = float(limit["percent"]) if limit else 0.0
         reset = parse_reset(limit["resets_at"]) if limit else None
         # Keep showing the last known figures; the flyout explains the trouble.
-        error = None if limit else short_error(usage.error)
-        state = (round(pct, 1), human_delta(reset), error, self.geometry,
+        # A metric the API never returns would otherwise read as a confident 0%.
+        error = None if limit else (short_error(usage.error) or "no data")
+        # Numbers that stopped being refreshed still deserve to be trusted less:
+        # dim them rather than pretend they are live.
+        age = usage.age_seconds()
+        stale = bool(usage.error) or (
+            age is not None and age > max(300.0, 3.0 * float(self.app.cfg["refresh_seconds"])))
+        state = (round(pct, 1), human_delta(reset), error, stale, self.geometry,
                  windows_uses_light_theme())
         if state == self._last_key:
             return
@@ -1983,6 +2096,8 @@ class TaskbarWidget(object):
 
         _, _, w, h = self.geometry
         self._image = self._render(w, h, pct, reset, error)
+        if stale:
+            self._image = fade_image(self._image, float(c.get("stale_opacity", 0.55)))
         if self.shown and not self._fading:
             self._blit(self._image, self._alpha)
 
@@ -2122,7 +2237,9 @@ class Toast(object):
         offset = self.px(12)
         anchor = getattr(self.app, "flyout_anchor", "right")
         x = rect.left + offset if anchor == "left" else rect.right - w - offset
-        self.win.geometry("%dx%d+%d+%d" % (w, h, x, rect.bottom - h - offset))
+        info = taskbar_info()
+        y = rect.top + offset if (info is not None and info[1] == ABE_TOP) else rect.bottom - h - offset
+        self.win.geometry("%dx%d+%d+%d" % (w, h, x, y))
 
         self.win.attributes("-alpha", 0.0)
         self.win.deiconify()
@@ -2176,6 +2293,29 @@ class Toast(object):
 _instance_mutex = None
 
 
+def set_dpi_awareness():
+    """Per-monitor v2 if this Windows has it: v1 leaves non-client areas scaled
+    by the system DPI, which puts the overlay in the wrong place on a second
+    monitor. The context is a pointer-sized handle - passing a bare int would
+    marshal as 32 bits and fail silently on 64-bit."""
+    try:
+        user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        user32.SetProcessDpiAwarenessContext.restype = wt.BOOL
+        if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):   # PMv2
+            return True
+    except Exception:
+        pass
+    try:
+        if ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0:         # PMv1
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(user32.SetProcessDPIAware())
+    except Exception:
+        return False
+
+
 def single_instance():
     """True if we own the single-instance slot.
 
@@ -2186,10 +2326,14 @@ def single_instance():
     """
     global _instance_mutex
     ctypes.set_last_error(0)
-    _instance_mutex = kernel32.CreateMutexW(None, False, "Local\\ClaudeUsageBarMutex")
-    if ctypes.get_last_error() != 183:  # ERROR_ALREADY_EXISTS
+    _instance_mutex = kernel32.CreateMutexW(None, True, "Local\\ClaudeUsageBarMutex")
+    if not _instance_mutex:
+        return True                      # can't tell; better to run than not to
+    if ctypes.get_last_error() != 183:   # ERROR_ALREADY_EXISTS: we created it
         return True
-    return not user32.FindWindowW("ClaudeUsageBarWnd", None)
+    # It already existed, so wait briefly for ownership rather than guessing
+    # from a window that the other instance may not have created yet.
+    return kernel32.WaitForSingleObject(_instance_mutex, 1500) in (0, 0x80)
 
 
 def main():
@@ -2198,13 +2342,8 @@ def main():
     if not single_instance():
         log("another instance is running; exiting")
         return
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
-        try:
-            user32.SetProcessDPIAware()
-        except Exception:
-            pass
+    if not set_dpi_awareness():
+        log("DPI awareness could not be set; coordinates may be scaled")
 
     root = tk.Tk()
     root.withdraw()
@@ -2212,44 +2351,35 @@ def main():
 
     msg = wt.MSG()
 
+    def every(name, interval_ms, body, first_ms=None):
+        """Run `body` forever. An exception inside a Tk timer callback kills its
+        chain silently, and under pythonw the traceback goes nowhere - which
+        would leave the app running but with one whole job (clicks, polling,
+        config reload) quietly dead. Every chain gets the same guard."""
+        def run():
+            try:
+                body()
+            except Exception:
+                log("%s failed: %s" % (name, traceback.format_exc()))
+            root.after(interval_ms, run)
+        root.after(interval_ms if first_ms is None else first_ms, run)
+
     def pump():
         while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
         app.apply_pending()
-        root.after(40, pump)
 
-    def tick():
+    def refetch():
         app.start_fetch()
-        root.after(max(10, int(app.cfg["refresh_seconds"])) * 1000, tick)
 
-    def watch_config():
-        if app.config_changed_on_disk():
-            app.reload_config()
-        root.after(2000, watch_config)
-
-    def clock():  # keep "resets in" fresh in the tooltip
-        app.update_icon()
-        root.after(30000, clock)
-
-    def keep_icons():
-        app.ensure_icons()
-        root.after(5000, keep_icons)
-
-    def keep_widget():
-        if app.widget is not None:
-            try:
-                app.widget.tick()
-            except Exception:
-                log("overlay tick failed: %s" % traceback.format_exc())
-        root.after(500, keep_widget)
-
-    root.after(50, pump)
-    root.after(100, tick)
-    root.after(2000, watch_config)
-    root.after(5000, keep_icons)
-    root.after(300, keep_widget)
-    root.after(30000, clock)
+    every("pump", 40, pump, first_ms=50)
+    every("poll", max(10, int(app.cfg["refresh_seconds"])) * 1000, refetch, first_ms=100)
+    every("config watch", 2000, lambda: app.reload_config() if app.config_changed_on_disk() else None)
+    every("tray icons", 5000, app.ensure_icons)
+    every("overlay", 500, lambda: app.widget.tick() if app.widget is not None else None,
+          first_ms=300)
+    every("clock", 30000, app.update_icon)
     root.mainloop()
 
 
