@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 claude_usage_bar.log
+widget/ClaudeUsageWidget/bin/
+widget/ClaudeUsageWidget/obj/
+widget/package/ClaudeUsageWidget/
+*.msix
