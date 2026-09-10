@@ -9,10 +9,34 @@ limit, and any model-scoped weekly limit, straight from
 `https://api.anthropic.com/api/oauth/usage`, authenticated with the OAuth token
 already stored in `~/.claude/.credentials.json`. Nothing else leaves the machine.
 
+It can draw itself in two places, independently:
+
+**Taskbar overlay** — a small always-visible readout in the taskbar's free left
+corner, where the weather widget used to be. Turn Widgets off (Settings →
+Personalization → Taskbar → Widgets) to clear the corner for it.
+
+```
+taskbar:  [15%  1h 30m ]                [start]  [search]   ...   13.20
+           ^ number, reset countdown and a bar, blended into the taskbar
+```
+
+**Tray icons** — one or more icons next to the clock.
+
 ```
 taskbar:  ... [OneDrive] [86] [wifi] [vol] [batt]  13.20
                           ^ colored pill = session %, thin strip = weekly %
 ```
+
+### Why an overlay and not a real widget
+
+Windows 11 has no way to put third-party content on the taskbar strip. The
+weather readout belongs to Microsoft's widgets service; deskbands, the supported
+extension point in Windows 10, were removed. Everything you see living on the
+Windows 11 taskbar — now-playing bars and the like — is a borderless window drawn
+over it, which is what this does. `widget/` holds the other route, a genuine
+widgets-board provider, but that one can only ever appear inside the Win+W panel.
+
+### Interaction
 
 * **Hover** — tooltip with both percentages and the reset countdown.
 * **Left click** — flyout with every limit, a bar each, and reset times.
@@ -55,7 +79,8 @@ you can keep a minimal file with just your overrides.
 | `refresh_seconds` | Poll interval. 60 is comfortable; the endpoint is cheap but don't go below ~15. |
 | `primary_metric` | What the big number/pill shows: `session`, `weekly_all`, `weekly_scoped`, or `max` (whichever limit is currently highest). |
 | `secondary_metric` | What the thin strip shows. Same values, or `null` to drop it. |
-| `left_click` | `flyout`, `refresh`, or `web`. |
+| `left_click` | `flyout`, `refresh`, or `web`. Applies to the tray icons and the overlay. |
+| `tray.enabled` | Draw the tray icons at all. Turn it off to run overlay-only. |
 | `usage_page_url` | Where "Open usage page" goes. |
 | `tooltip_template` | See placeholders below. |
 
@@ -84,6 +109,37 @@ you can keep a minimal file with just your overrides.
 | `show_secondary`, `secondary_color` | The thin second-metric strip. |
 | `ring_thickness` | Donut width for `style: ring`. |
 | `supersample` | Anti-aliasing factor (8 = render at 8× then downscale). Lower it only if CPU matters. |
+
+### `taskbar_widget`
+
+The overlay. It follows the taskbar's position, height and DPI, samples the
+taskbar's own colour so it blends in, re-asserts itself above the taskbar every
+half second, and hides while a fullscreen app is in front.
+
+| Key | Meaning |
+| --- | --- |
+| `enabled` | Master switch. |
+| `metric` | Which limit to show. `null` = whatever `primary_metric` is. |
+| `corner` | `left` (where Widgets used to be) or `right` (before the tray). |
+| `width` | Width in logical pixels at 100% DPI; scaled with the taskbar. |
+| `offset` | `[x, y]` nudge from the corner, also DPI-scaled. |
+| `padding` | Gap above and below, so it doesn't touch the taskbar edges. |
+| `background` | `auto` samples the taskbar next to the overlay. A hex colour pins it. |
+| `text_color` / `muted_color` | The number and the countdown. `auto` follows the Windows theme. |
+| `track_color` | `auto` tints the taskbar colour towards the text colour. |
+| `show_bar`, `bar_height` | The progress bar under the countdown. |
+| `show_reset` | The reset countdown. Drop it to save width. |
+| `hide_on_fullscreen` | Get out of the way of games and full-screen video. |
+| `supersample` | Render scale for the text; 3 is plenty. |
+
+At 100% the number is replaced by the same drawn skull the tray uses.
+
+**Limits worth knowing.** With the taskbar centred, the left corner is free until
+you have a lot of windows open — Windows will happily slide app buttons under the
+overlay, since nothing reserves that space. Move it with `corner`/`offset` if that
+bites. A vertical taskbar isn't supported (the overlay hides itself). And because
+this leans on the taskbar's shape, a Windows update that reworks the taskbar can
+require a fix here — the tray icons are the fallback that can't break that way.
 
 ### Going wider than a square
 
@@ -209,7 +265,8 @@ bottom-right of the work area), `close_on_focus_loss`.
   `auth` — running any Claude Code command refreshes the credentials file and the
   next poll picks it up automatically.
 * Network blips show `offline` in the tooltip without wiping the displayed numbers.
-* The icon re-registers itself if Explorer restarts.
+* The icon re-registers itself if Explorer restarts; the overlay re-reads the
+  taskbar's geometry twice a second, so it follows moves, resizes and DPI changes.
 * Notifications fire once per threshold per reset window — sitting at 100% does
   not re-notify, and the counter resets when the window rolls over.
 * Errors go to `claude_usage_bar.log` next to the script (right click → Open log).

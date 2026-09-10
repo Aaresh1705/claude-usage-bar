@@ -18,6 +18,7 @@ import time
 import traceback
 import uuid
 import webbrowser
+import winreg
 from datetime import datetime, timezone
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -80,6 +81,26 @@ DEFAULT_CONFIG = {
         "corner_offset": [12, 12],
         "close_on_focus_loss": True,
     },
+    "tray": {"enabled": True},
+    "taskbar_widget": {
+        "enabled": False,
+        "metric": None,
+        "corner": "left",
+        "width": 128,
+        "offset": [8, 0],
+        "padding": 5,
+        "background": "auto",
+        "text_color": "auto",
+        "muted_color": "#9BA0A6",
+        "font_file": "segoeui.ttf",
+        "bold_font_file": "segoeuib.ttf",
+        "show_bar": True,
+        "show_reset": True,
+        "bar_height": 4,
+        "track_color": "auto",
+        "hide_on_fullscreen": True,
+        "supersample": 3,
+    },
     "left_click": "flyout",
     "usage_page_url": "https://claude.ai/settings/usage",
 }
@@ -106,17 +127,19 @@ def import_dependencies(attempts=20, delay=3.0):
     As a plain module-level import that was a silent death with nothing in the
     log; here every failure is at least recorded.
     """
-    global requests, Image, ImageDraw, ImageFont
+    global requests, Image, ImageDraw, ImageFont, ImageTk
     last = ""
     for attempt in range(attempts):
         try:
             import requests as _requests
             from PIL import Image as _Image, ImageDraw as _ImageDraw, ImageFont as _ImageFont
+            from PIL import ImageTk as _ImageTk
         except Exception as exc:
             last = repr(exc)
             time.sleep(delay)
             continue
         requests, Image, ImageDraw, ImageFont = _requests, _Image, _ImageDraw, _ImageFont
+        ImageTk = _ImageTk
         if attempt:
             log("dependencies imported after %d retries" % attempt)
         return True
@@ -653,6 +676,8 @@ class TrayApp(object):
         self.icon_slot = 0
         self.last_notified = {}
         self.flyout = None
+        self.widget = None
+        self.flyout_anchor = "right"
         self._fetching = False
         self._pending = None
         self._lock = threading.Lock()
@@ -671,6 +696,7 @@ class TrayApp(object):
                                            0, 0, 0, 0, 0, None, None, self.hinst, None)
         self.wm_taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")
         self._add_icon()
+        self.sync_widget()
 
     # -- tray icon ---------------------------------------------------------
     def _nid(self, flags, uid=1):
@@ -751,7 +777,13 @@ class TrayApp(object):
             text = "Claude %s%%" % values["primary"]
         return text[:127]
 
+    def tray_enabled(self):
+        return bool((self.cfg.get("tray") or {}).get("enabled", True))
+
     def _add_icon(self):
+        if not self.tray_enabled():
+            self.registered = self._segment_count()   # nothing to keep alive
+            return True
         tip = self._tooltip()
         icons = self._make_hicons()
         added = 0
@@ -775,6 +807,8 @@ class TrayApp(object):
     def ensure_icons(self):
         """Right after logon Explorer often refuses tray icons for a while;
         keep re-adding until they all stick."""
+        if not self.tray_enabled():
+            return
         want = self._segment_count()
         if self.registered >= want:
             return
@@ -783,6 +817,10 @@ class TrayApp(object):
             log("tray icons registered (%d)" % want)
 
     def update_icon(self):
+        if self.widget is not None:
+            self.widget.refresh(self.usage)
+        if not self.tray_enabled():
+            return
         if self.registered != self._segment_count():
             self.remove_icon()
             self._add_icon()
@@ -798,6 +836,8 @@ class TrayApp(object):
                 return
 
     def notify(self, title, body):
+        if not self.tray_enabled():
+            return
         nid = self._nid(NIF_INFO)
         nid.szInfoTitle = title[:63]
         nid.szInfo = body[:255]
@@ -943,7 +983,24 @@ class TrayApp(object):
         if self.flyout is not None:
             self.flyout.destroy()
             self.flyout = None
+        if not self.tray_enabled():
+            self.remove_icon()
+        self.sync_widget()
         self.update_icon()
+
+    def sync_widget(self):
+        """Create or drop the taskbar overlay to match the config."""
+        want = bool((self.cfg.get("taskbar_widget") or {}).get("enabled"))
+        if want and self.widget is None:
+            self.widget = TaskbarWidget(self)
+            log("taskbar overlay on")
+        elif not want and self.widget is not None:
+            self.widget.destroy()
+            self.widget = None
+            self.flyout_anchor = "right"
+            log("taskbar overlay off")
+        elif self.widget is not None:
+            self.widget.reconfigure()
 
     def config_changed_on_disk(self):
         try:
@@ -965,6 +1022,8 @@ class TrayApp(object):
         self.flyout.show(self.usage)
 
     def quit(self):
+        if self.widget is not None:
+            self.widget.destroy()
         self.remove_icon()
         for handle in self.hicons:
             if handle:
@@ -1076,7 +1135,10 @@ class Flyout(object):
         rect = wt.RECT()
         user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0)  # SPI_GETWORKAREA
         ox, oy = f.get("corner_offset", [12, 12])
-        x = rect.right - w - int(ox)
+        if getattr(self.app, "flyout_anchor", "right") == "left":
+            x = rect.left + int(ox)
+        else:
+            x = rect.right - w - int(ox)
         y = rect.bottom - h - int(oy)
         self.win.geometry("%dx%d+%d+%d" % (w, h, x, y))
         self.win.deiconify()
@@ -1087,6 +1149,393 @@ class Flyout(object):
     def hide(self):
         self.win.withdraw()
         self.visible = False
+
+
+# ---------------------------------------------------------------------------
+# Taskbar overlay
+#
+# Windows 11 dropped deskbands, and the widgets board can't put anything on the
+# taskbar itself, so the only way to be permanently visible down there is to
+# draw our own window over the taskbar's free corner - the same trick the
+# now-playing widgets use. It has to follow the taskbar: position, DPI,
+# auto-hide, Explorer restarts, and it must get out of the way of fullscreen
+# apps.
+# ---------------------------------------------------------------------------
+
+ABM_GETSTATE = 0x00000004
+ABM_GETTASKBARPOS = 0x00000005
+ABS_AUTOHIDE = 0x00000001
+ABE_LEFT, ABE_TOP, ABE_RIGHT, ABE_BOTTOM = 0, 1, 2, 3
+GWL_EXSTYLE = -20
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_NOACTIVATE = 0x08000000
+HWND_TOPMOST = -1
+SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
+MONITOR_DEFAULTTONEAREST = 2
+
+
+class APPBARDATA(ctypes.Structure):
+    _fields_ = [("cbSize", wt.DWORD), ("hWnd", wt.HWND), ("uCallbackMessage", wt.UINT),
+                ("uEdge", wt.UINT), ("rc", wt.RECT), ("lParam", wt.LPARAM)]
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT), ("rcWork", wt.RECT),
+                ("dwFlags", wt.DWORD)]
+
+
+shell32.SHAppBarMessage.restype = ctypes.c_size_t
+shell32.SHAppBarMessage.argtypes = [wt.DWORD, ctypes.POINTER(APPBARDATA)]
+user32.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
+                                ctypes.c_int, ctypes.c_int, wt.UINT]
+user32.GetForegroundWindow.restype = wt.HWND
+user32.MonitorFromWindow.restype = wt.HANDLE
+user32.MonitorFromWindow.argtypes = [wt.HWND, wt.DWORD]
+if hasattr(user32, "GetWindowLongPtrW"):
+    user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+    user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+
+
+def taskbar_info():
+    """(rect, edge, autohidden) for the taskbar, or None if it can't be found."""
+    data = APPBARDATA()
+    data.cbSize = ctypes.sizeof(APPBARDATA)
+    if not shell32.SHAppBarMessage(ABM_GETTASKBARPOS, ctypes.byref(data)):
+        return None
+    state = shell32.SHAppBarMessage(ABM_GETSTATE, ctypes.byref(data))
+    return data.rc, data.uEdge, bool(state & ABS_AUTOHIDE)
+
+
+def foreground_is_fullscreen():
+    """True when the focused window covers its whole monitor - games, video,
+    slideshows. The shell itself doesn't count."""
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return False
+    cls = ctypes.create_unicode_buffer(64)
+    user32.GetClassNameW(hwnd, cls, 64)
+    if cls.value in ("Shell_TrayWnd", "Progman", "WorkerW", "Windows.UI.Core.CoreWindow"):
+        return False
+    rect = wt.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return False
+    mi = MONITORINFO()
+    mi.cbSize = ctypes.sizeof(MONITORINFO)
+    monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+    if not monitor or not user32.GetMonitorInfoW(monitor, ctypes.byref(mi)):
+        return False
+    m = mi.rcMonitor
+    return (rect.left <= m.left and rect.top <= m.top
+            and rect.right >= m.right and rect.bottom >= m.bottom)
+
+
+gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+gdi32.GetPixel.restype = wt.DWORD
+gdi32.GetPixel.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int]
+user32.GetDC.restype = wt.HDC
+user32.ReleaseDC.argtypes = [wt.HWND, wt.HDC]
+
+CLR_INVALID = 0xFFFFFFFF
+
+
+def blend(a, b, t):
+    return tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
+
+
+def sample_taskbar_color(rect, x_from, x_to):
+    """The taskbar is translucent, so its colour depends on the wallpaper and
+    the accent colour. Reading it off the screen beats guessing from the theme:
+    take the most common pixel just beside where we sit."""
+    hdc = user32.GetDC(None)
+    if not hdc:
+        return None
+    try:
+        y = (rect.top + rect.bottom) // 2
+        counts = {}
+        steps = 12
+        for i in range(steps):
+            x = int(x_from + (x_to - x_from) * i / float(steps))
+            value = gdi32.GetPixel(hdc, x, y)
+            if value == CLR_INVALID:
+                continue
+            counts[value] = counts.get(value, 0) + 1
+        if not counts:
+            return None
+        best = max(counts.items(), key=lambda kv: kv[1])[0]
+        return (best & 0xFF, (best >> 8) & 0xFF, (best >> 16) & 0xFF)
+    finally:
+        user32.ReleaseDC(None, hdc)
+
+
+def windows_uses_light_theme():
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        with key:
+            return bool(winreg.QueryValueEx(key, "SystemUsesLightTheme")[0])
+    except Exception:
+        return False
+
+
+class TaskbarWidget(object):
+    """A small always-visible readout docked in the taskbar's free corner."""
+
+    def __init__(self, app):
+        self.app = app
+        self.win = tk.Toplevel(root)
+        self.win.withdraw()
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.label = tk.Label(self.win, bd=0, highlightthickness=0)
+        self.label.pack(fill="both", expand=True)
+        # Only the label is bound: it fills the window, and binding both would
+        # deliver every click twice (open the flyout, then close it again).
+        self.label.bind("<Button-1>", self._on_left)
+        self.label.bind("<Button-3>", self._on_right)
+        self.label.configure(cursor="hand2")
+
+        self.hwnd = None
+        self.photo = None
+        self.geometry = None
+        self.shown = False
+        self._last_key = None
+        self._bg_sampled = None
+        self._bg_at = 0.0
+        self.reconfigure()
+
+    # -- window plumbing ---------------------------------------------------
+    def _apply_ex_styles(self):
+        """No taskbar button, no alt-tab entry, and clicks must never steal
+        focus from whatever the user is typing in."""
+        self.win.update_idletasks()
+        hwnd = self.win.winfo_id()
+        parent = user32.GetParent(hwnd)
+        self.hwnd = parent or hwnd
+        get = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
+        put = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+        style = get(self.hwnd, GWL_EXSTYLE)
+        put(self.hwnd, GWL_EXSTYLE, style | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
+
+    def cfg(self):
+        return self.app.cfg.get("taskbar_widget") or {}
+
+    def reconfigure(self):
+        self._last_key = None
+        self.refresh(self.app.usage)
+
+    def destroy(self):
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+    def _on_left(self, _event):
+        action = self.app.cfg.get("left_click", "flyout")
+        if action == "flyout":
+            self.app.toggle_flyout()
+        elif action == "refresh":
+            self.app.start_fetch()
+        elif action == "web":
+            webbrowser.open(self.app.cfg.get("usage_page_url"))
+        return "break"
+
+    def _on_right(self, _event):
+        self.app.show_menu()
+        return "break"
+
+    # -- placement ---------------------------------------------------------
+    def _target_geometry(self):
+        """Where to sit, or None when the taskbar is hidden or not horizontal."""
+        info = taskbar_info()
+        if info is None:
+            return None
+        rect, edge, autohide = info
+        if edge not in (ABE_TOP, ABE_BOTTOM):
+            return None            # vertical taskbar: no corner worth taking
+        height = rect.bottom - rect.top
+        if height <= 0 or rect.right <= rect.left:
+            return None
+        if autohide:
+            # While hidden the taskbar parks itself just off the screen edge.
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            monitor = user32.MonitorFromWindow(user32.FindWindowW("Shell_TrayWnd", None),
+                                               MONITOR_DEFAULTTONEAREST)
+            if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(mi)):
+                m = mi.rcMonitor
+                if rect.bottom <= m.top + 2 or rect.top >= m.bottom - 2:
+                    return None
+
+        c = self.cfg()
+        scale = height / 48.0                      # 48px is the 100% DPI taskbar
+        pad = max(2, int(float(c.get("padding", 5)) * scale))
+        h = max(12, height - 2 * pad)
+        w = max(40, int(float(c.get("width", 128)) * scale))
+        ox, oy = (c.get("offset") or [8, 0])[:2]
+        ox, oy = int(float(ox) * scale), int(float(oy) * scale)
+
+        if str(c.get("corner", "left")) == "right":
+            x = rect.right - w - ox
+        else:
+            x = rect.left + ox
+        y = rect.top + (height - h) // 2 + oy
+        return x, y, w, h
+
+    def tick(self):
+        """Called on a timer: keep position, visibility and Z-order honest."""
+        if self.app.cfg.get("taskbar_widget", {}).get("hide_on_fullscreen", True) \
+                and foreground_is_fullscreen():
+            self._hide()
+            return
+        geometry = self._target_geometry()
+        if geometry is None:
+            self._hide()
+            return
+        if geometry != self.geometry:
+            self.geometry = geometry
+            x, y, w, h = geometry
+            self.win.geometry("%dx%d+%d+%d" % (w, h, x, y))
+            self._last_key = None            # re-render at the new size
+            self.refresh(self.app.usage)
+        self._show()
+        if self.hwnd:
+            # The taskbar is topmost too; keep re-asserting our place above it.
+            user32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+
+    def _show(self):
+        if not self.shown:
+            self.win.deiconify()
+            self.shown = True
+            if self.hwnd is None:
+                self._apply_ex_styles()
+            self.app.flyout_anchor = str(self.cfg().get("corner", "left"))
+
+    def _hide(self):
+        if self.shown:
+            self.win.withdraw()
+            self.shown = False
+
+    # -- drawing -----------------------------------------------------------
+    def _taskbar_bg(self):
+        """Cached sample of the taskbar colour next to the overlay."""
+        now = time.time()
+        if self._bg_sampled is not None and now - self._bg_at < 4.0:
+            return self._bg_sampled
+        self._bg_at = now
+        info = taskbar_info()
+        if info is not None and self.geometry is not None:
+            rect = info[0]
+            x, _, w, _ = self.geometry
+            gap = max(24, w // 4)
+            if str(self.cfg().get("corner", "left")) == "right":
+                self._bg_sampled = sample_taskbar_color(rect, max(rect.left, x - gap * 2), x - 8)
+            else:
+                self._bg_sampled = sample_taskbar_color(rect, x + w + 8, min(rect.right - 2, x + w + gap * 2))
+        return self._bg_sampled
+
+    def _colors(self):
+        c = self.cfg()
+        light = windows_uses_light_theme()
+        bg = c.get("background", "auto")
+        fg = c.get("text_color", "auto")
+        if bg == "auto":
+            sampled = self._taskbar_bg()
+            bg = "#%02X%02X%02X" % sampled if sampled else ("#F3F3F3" if light else "#1F1F1F")
+        if fg == "auto":
+            fg = "#1A1A1A" if light else "#F2F2F2"
+        return bg, fg, c.get("muted_color", "#9BA0A6")
+
+    def refresh(self, usage):
+        if self.geometry is None:
+            return
+        c = self.cfg()
+        key = c.get("metric") or self.app.cfg["primary_metric"]
+        limit = usage.by_key(key)
+        pct = float(limit["percent"]) if limit else 0.0
+        reset = parse_reset(limit["resets_at"]) if limit else None
+        state = (round(pct, 1), human_delta(reset), usage.error, self.geometry,
+                 self._taskbar_bg(), windows_uses_light_theme())
+        if state == self._last_key:
+            return
+        self._last_key = state
+
+        _, _, w, h = self.geometry
+        image = self._render(w, h, pct, reset, usage.error)
+        self.photo = ImageTk.PhotoImage(image)
+        bg = self._colors()[0]
+        self.label.configure(image=self.photo, bg=bg)
+        self.win.configure(bg=bg)
+
+    def _render(self, w, h, pct, reset, error):
+        c = self.cfg()
+        bg, fg, muted = self._colors()
+        ss = max(1, int(c.get("supersample", 3)))
+        img = Image.new("RGB", (w * ss, h * ss), hex_to_rgba(bg)[:3])
+        d = ImageDraw.Draw(img)
+        W, H = w * ss, h * ss
+        pct = max(0.0, min(100.0, pct))
+        color = color_for(pct, self.app.cfg["thresholds"])
+        spent = pct >= 99.5
+
+        def font(px, bold=True):
+            name = c.get("bold_font_file" if bold else "font_file",
+                         "segoeuib.ttf" if bold else "segoeui.ttf")
+            return load_font({"font_file": name}, px)
+
+        if error:
+            d.text((0, H / 2), " " + str(error)[:18], font=font(H * 0.42, False),
+                   fill=hex_to_rgba(muted)[:3], anchor="lm")
+            return img.resize((w, h), Image.LANCZOS)
+
+        # Left: the number (or the skull, same as the tray at 100%).
+        num_font = font(H * 0.62)
+        if spent:
+            skull_w = H * 0.52
+            layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            draw_skull(layer, (0, H * 0.18, skull_w, H * 0.82), hex_to_rgba(color), False)
+            img.paste(layer, (0, 0), layer)
+            text_end = skull_w
+        else:
+            label = "%d%%" % round(pct)
+            d.text((0, H / 2), label, font=num_font, fill=hex_to_rgba(color)[:3], anchor="lm")
+            text_end = d.textlength(label, font=num_font)
+
+        x0 = text_end + H * 0.22
+        if x0 >= W:
+            return img.resize((w, h), Image.LANCZOS)
+
+        # Right: countdown over a slim bar, both inside the remaining width.
+        show_reset = bool(c.get("show_reset", True)) and reset is not None
+        show_bar = bool(c.get("show_bar", True))
+        bar_h = float(c.get("bar_height", 4)) * ss * (h / 38.0)   # 38px tall at 100% DPI
+        bar_h = int(max(2 * ss, min(H * 0.22, bar_h)))
+
+        if show_reset:
+            small = font(H * 0.36, False)
+            text = human_delta(reset)
+            while d.textlength(text, font=small) > (W - x0) and len(text) > 4:
+                text = text[:-1]
+            d.text((x0, H * 0.30), text, font=small, fill=hex_to_rgba(muted)[:3], anchor="lm")
+            bar_y = H * 0.62
+        else:
+            bar_y = H / 2 - bar_h / 2
+
+        if show_bar:
+            track = c.get("track_color", "auto")
+            if track == "auto":
+                # A tint of the taskbar towards the text colour: readable on a
+                # light taskbar and on a dark one without configuring anything.
+                track = blend(hex_to_rgba(bg)[:3], hex_to_rgba(fg)[:3], 0.22)
+            else:
+                track = hex_to_rgba(track)[:3]
+            d.rounded_rectangle((x0, bar_y, W - 1, bar_y + bar_h), radius=bar_h / 2, fill=track)
+            span = (W - 1 - x0) * pct / 100.0
+            if span > 0:
+                d.rounded_rectangle((x0, bar_y, x0 + max(span, bar_h), bar_y + bar_h),
+                                    radius=bar_h / 2, fill=hex_to_rgba(color)[:3])
+
+        return img.resize((w, h), Image.LANCZOS)
 
 
 # ---------------------------------------------------------------------------
@@ -1156,10 +1605,19 @@ def main():
         app.ensure_icons()
         root.after(5000, keep_icons)
 
+    def keep_widget():
+        if app.widget is not None:
+            try:
+                app.widget.tick()
+            except Exception:
+                log("overlay tick failed: %s" % traceback.format_exc())
+        root.after(500, keep_widget)
+
     root.after(50, pump)
     root.after(100, tick)
     root.after(2000, watch_config)
     root.after(5000, keep_icons)
+    root.after(300, keep_widget)
     root.after(30000, clock)
     root.mainloop()
 
