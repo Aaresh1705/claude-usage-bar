@@ -27,6 +27,7 @@ LOG_PATH = os.path.join(APP_DIR, "claude_usage_bar.log")
 FALLBACK_LOG = os.path.join(os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP", "."),
                             "claude-usage-bar", "claude_usage_bar.log")
 ICON_CACHE = os.path.join(APP_DIR, ".icons")
+USAGE_CACHE = os.path.join(APP_DIR, ".usage_cache.json")
 CRED_PATH = os.path.expanduser(os.path.join("~", ".claude", ".credentials.json"))
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 FONT_DIR = os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts")
@@ -69,15 +70,9 @@ DEFAULT_CONFIG = {
     "tooltip_template": "Claude \u00b7 {primary_label}: {primary}%\n{secondary_label}: {secondary}%\nResets {primary_reset_short} (in {primary_reset_in})",
     "notifications": {"enabled": True, "at": [80, 95], "metric": "session"},
     "flyout": {
-        "width": 340,
-        "background": "#1E1E1E",
-        "foreground": "#E6E6E6",
-        "muted": "#9A9A9A",
-        "accent": "#C96442",
-        "track_color": "#3A3A3A",
-        "font_family": "Segoe UI",
-        "font_size": 9,
-        "title_size": 11,
+        "width": 320,
+        "theme": "auto",
+        "accent": "auto",
         "corner_offset": [12, 12],
         "close_on_focus_loss": True,
     },
@@ -199,6 +194,9 @@ LABELS = {
 
 
 class Usage(object):
+    status = None
+    stale = False
+
     def __init__(self):
         self.limits = []
         self.spend = None
@@ -245,7 +243,14 @@ def fetch_usage():
             timeout=20,
         )
         if resp.status_code != 200:
-            u.error = "auth" if resp.status_code in (401, 403) else "HTTP %s" % resp.status_code
+            u.status = resp.status_code
+            u.error = {
+                401: "Signed out - run any Claude Code command",
+                403: "Signed out - run any Claude Code command",
+                429: "Rate limited by the usage API",
+                500: "Usage service is having trouble",
+                503: "Usage service is having trouble",
+            }.get(resp.status_code, "Usage API error (HTTP %s)" % resp.status_code)
             log("usage http %s" % resp.status_code)
             return u
         data = resp.json()
@@ -281,13 +286,41 @@ def fetch_usage():
         u.extra = data.get("extra_usage")
         u.updated = datetime.now()
     except FileNotFoundError:
-        u.error = "not logged in"
+        u.error = "Not signed in to Claude Code"
     except requests.RequestException:
-        u.error = "offline"
+        u.error = "Offline"
     except Exception:
-        u.error = "error"
+        u.error = "Something went wrong"
         log("fetch failed: %s" % traceback.format_exc())
     return u
+
+
+def save_usage_cache(usage):
+    try:
+        with open(USAGE_CACHE, "w", encoding="utf-8") as fh:
+            json.dump({"limits": usage.limits, "extra": usage.extra, "spend": usage.spend,
+                       "updated": usage.updated.isoformat() if usage.updated else None}, fh)
+    except Exception:
+        pass
+
+
+def load_usage_cache():
+    """Show the last known numbers immediately at startup instead of a blank
+    panel - a fresh poll can be a minute away, or rate limited."""
+    u = Usage()
+    try:
+        with open(USAGE_CACHE, "r", encoding="utf-8") as fh:
+            blob = json.load(fh)
+        u.limits = blob.get("limits") or []
+        u.extra, u.spend = blob.get("extra"), blob.get("spend")
+        if blob.get("updated"):
+            u.updated = datetime.fromisoformat(blob["updated"])
+        if not u.limits:
+            return None
+        u.stale = True
+        return u
+    except Exception:
+        return None
 
 
 def parse_reset(value):
@@ -668,8 +701,9 @@ class TrayApp(object):
         self.cfg = load_config()
         self.use_guid = bool(self.cfg["icon"].get("use_guid", True))
         self.cfg_mtime = os.path.getmtime(CONFIG_PATH) if os.path.exists(CONFIG_PATH) else 0
-        self.usage = Usage()
-        self.usage.error = "loading"
+        self.usage = load_usage_cache() or Usage()
+        if not self.usage.limits:
+            self.usage.error = "Loading…"
         self.hicons = []
         self.registered = 0
         self.use_guid = bool(self.cfg["icon"].get("use_guid", True))
@@ -680,6 +714,8 @@ class TrayApp(object):
         self.flyout_anchor = "right"
         self._fetching = False
         self._pending = None
+        self.backoff = 0
+        self.retry_at = 0
         self._lock = threading.Lock()
 
         os.makedirs(ICON_CACHE, exist_ok=True)
@@ -879,7 +915,7 @@ class TrayApp(object):
         if cmd == CMD_DETAILS:
             self.toggle_flyout()
         elif cmd == CMD_REFRESH:
-            self.start_fetch()
+            self.start_fetch(manual=True)
         elif cmd == CMD_CONFIG:
             os.startfile(CONFIG_PATH)
         elif cmd == CMD_RELOAD:
@@ -903,7 +939,7 @@ class TrayApp(object):
                 if action == "flyout":
                     self.toggle_flyout()
                 elif action == "refresh":
-                    self.start_fetch()
+                    self.start_fetch(manual=True)
                 elif action == "web":
                     webbrowser.open(self.cfg.get("usage_page_url"))
             elif event in (WM_RBUTTONUP, WM_CONTEXTMENU):
@@ -922,8 +958,21 @@ class TrayApp(object):
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     # -- data --------------------------------------------------------------
-    def start_fetch(self):
+    def note_rate_limit(self, result):
+        """429 means the endpoint wants us to slow down; polling it every minute
+        regardless just keeps it angry (and floods the log)."""
+        if getattr(result, "status", None) == 429:
+            self.backoff = min(max(self.backoff * 2, 120), 1800)
+            self.retry_at = time.time() + self.backoff
+            log("rate limited; next poll in %ds" % self.backoff)
+        elif not result.error:
+            self.backoff = 0
+            self.retry_at = 0
+
+    def start_fetch(self, manual=False):
         if self._fetching:
+            return
+        if not manual and self.retry_at and time.time() < self.retry_at:
             return
         self._fetching = True
 
@@ -940,11 +989,14 @@ class TrayApp(object):
             result, self._pending = self._pending, None
         if result is None:
             return
-        if result.error and result.error != "not logged in" and self.usage.limits:
+        if result.error and result.error != "Not signed in to Claude Code" and self.usage.limits:
             result.limits = self.usage.limits  # keep last good numbers on a blip
             result.spend, result.extra = self.usage.spend, self.usage.extra
             result.updated = self.usage.updated
         self.usage = result
+        if not result.error:
+            save_usage_cache(result)
+        self.note_rate_limit(result)
         self.update_icon()
         self.check_notifications()
         if self.flyout is not None:
@@ -1042,22 +1094,182 @@ class TrayApp(object):
 import tkinter as tk
 
 
+# Fluent surface colours, straight from the Windows 11 palette, so the flyout
+# reads as a system surface rather than as someone's themed app window.
+FLUENT = {
+    "light": {
+        "surface": "#F9F9F9", "border": "#E5E5E5", "text": "#1A1A1A",
+        "muted": "#5D5D5D", "track": "#D6D6D6", "divider": "#EAEAEA",
+        "button": "#FDFDFD", "button_border": "#D9D9D9", "button_hover": "#F2F2F2",
+        "accent_text": "#FFFFFF",
+        "good": "#0F7B0F", "caution": "#9D5D00", "critical": "#C42B1C",
+    },
+    "dark": {
+        "surface": "#2C2C2C", "border": "#1D1D1D", "text": "#FFFFFF",
+        "muted": "#C7C7C7", "track": "#4A4A4A", "divider": "#3A3A3A",
+        "button": "#383838", "button_border": "#454545", "button_hover": "#414141",
+        "accent_text": "#000000",
+        "good": "#6CCB5F", "caution": "#FCE100", "critical": "#FF99A4",
+    },
+}
+
+DWMWA_WINDOW_CORNER_PREFERENCE = 33
+DWMWA_ROUND = 2
+
+try:
+    dwmapi = ctypes.WinDLL("dwmapi")
+except Exception:
+    dwmapi = None
+
+
+def round_window_corners(hwnd):
+    """Windows 11 rounds its own flyouts; a borderless Tk window stays square
+    unless we ask DWM for the same treatment."""
+    if dwmapi is None or not hwnd:
+        return
+    try:
+        value = ctypes.c_int(DWMWA_ROUND)
+        dwmapi.DwmSetWindowAttribute(wt.HWND(hwnd), DWMWA_WINDOW_CORNER_PREFERENCE,
+                                     ctypes.byref(value), ctypes.sizeof(value))
+    except Exception:
+        pass
+
+
+def ui_scale():
+    """Pixels per logical pixel for the display the taskbar is on."""
+    try:
+        dpi = user32.GetDpiForSystem()
+    except Exception:
+        dpi = 96
+    return max(1.0, (dpi or 96) / 96.0)
+
+
 class Flyout(object):
+    """The details panel. Modelled on the Windows 11 quick-settings flyouts:
+    system surface colour, rounded corners, accent-coloured primary button,
+    Segoe UI Variable type, and it closes when you click away."""
+
     def __init__(self, app):
         self.app = app
         self.visible = False
-        f = app.cfg["flyout"]
+        self.scale = ui_scale()
+        self._images = []          # keep PhotoImages alive
+        self._hwnd = None
+
         self.win = tk.Toplevel(root)
         self.win.withdraw()
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
-        self.win.configure(bg=f["accent"])
-        self.body = tk.Frame(self.win, bg=f["background"], padx=14, pady=12)
-        self.body.pack(padx=1, pady=1, fill="both", expand=True)
+        self.outer = tk.Frame(self.win)
+        self.outer.pack(fill="both", expand=True, padx=1, pady=1)
+        self.body = tk.Frame(self.outer)
+        self.body.pack(fill="both", expand=True)
         self.win.bind("<Escape>", lambda e: self.hide())
-        if f.get("close_on_focus_loss", True):
+        if (app.cfg["flyout"] or {}).get("close_on_focus_loss", True):
             self.win.bind("<FocusOut>", lambda e: self.hide())
 
+    # -- theme -------------------------------------------------------------
+    def theme(self):
+        want = str((self.app.cfg["flyout"] or {}).get("theme", "auto")).lower()
+        if want not in ("light", "dark"):
+            want = "light" if windows_uses_light_theme() else "dark"
+        return FLUENT[want]
+
+    def accent(self):
+        value = (self.app.cfg["flyout"] or {}).get("accent", "auto")
+        return windows_accent_color() if value == "auto" else value
+
+    def px(self, logical):
+        return max(1, int(round(logical * self.scale)))
+
+    def font(self, size, weight="normal"):
+        family = self._family()
+        return (family, -self.px(size), "bold" if weight == "bold" else "normal")
+
+    def _family(self):
+        if getattr(self, "_cached_family", None):
+            return self._cached_family
+        try:
+            import tkinter.font as tkfont
+            available = set(tkfont.families(root))
+        except Exception:
+            available = set()
+        for name in ("Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI"):
+            if name in available:
+                self._cached_family = name
+                return name
+        self._cached_family = "Segoe UI"
+        return self._cached_family
+
+    def severity_color(self, pct, colors):
+        """Rank the configured thresholds, then paint with the Fluent colour for
+        that rank so the flyout stays legible in both themes."""
+        ranks = sorted(self.app.cfg["thresholds"], key=lambda t: float(t.get("at", 0)))
+        index = 0
+        for i, threshold in enumerate(ranks):
+            if pct >= float(threshold.get("at", 0)):
+                index = i
+        return [colors["good"], colors["caution"], colors["critical"]][min(index, 2)]
+
+    # -- drawn pieces ------------------------------------------------------
+    def _bar(self, width, pct, color, colors):
+        h = self.px(6)
+        ss = 4
+        img = Image.new("RGBA", (width * ss, h * ss), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        radius = h * ss / 2.0
+        d.rounded_rectangle((0, 0, width * ss - 1, h * ss - 1), radius=radius,
+                            fill=hex_to_rgba(colors["track"]))
+        span = (width * ss - 1) * max(0.0, min(100.0, pct)) / 100.0
+        if span > 0:
+            d.rounded_rectangle((0, 0, max(span, h * ss), h * ss - 1), radius=radius,
+                                fill=hex_to_rgba(color))
+        photo = ImageTk.PhotoImage(img.resize((width, h), Image.LANCZOS))
+        self._images.append(photo)
+        return photo
+
+    def _button_images(self, text, colors, accent=False):
+        """Rounded Fluent buttons, rendered twice for the hover state."""
+        pad_x, height, radius = self.px(12), self.px(30), self.px(4)
+        font_px = self.px(13)
+        probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+        pil_font = load_font({"font_file": "segoeui.ttf"}, font_px)
+        width = int(probe.textlength(text, font=pil_font)) + pad_x * 2
+
+        out = []
+        for hovered in (False, True):
+            ss = 3
+            img = Image.new("RGBA", (width * ss, height * ss), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            if accent:
+                base = self.accent()
+                fill = hex_to_rgba(base, 235 if hovered else 255)
+                border = fill
+                fg = colors["accent_text"]
+            else:
+                fill = hex_to_rgba(colors["button_hover"] if hovered else colors["button"])
+                border = hex_to_rgba(colors["button_border"])
+                fg = colors["text"]
+            d.rounded_rectangle((0, 0, width * ss - 1, height * ss - 1), radius=radius * ss,
+                                fill=fill, outline=border, width=ss)
+            big = load_font({"font_file": "segoeui.ttf"}, font_px * ss)
+            draw_text_centered(d, (0, 0, width * ss, height * ss), text, big,
+                               hex_to_rgba(fg), False)
+            photo = ImageTk.PhotoImage(img.resize((width, height), Image.LANCZOS))
+            self._images.append(photo)
+            out.append(photo)
+        return out
+
+    def _button(self, parent, text, command, colors, accent=False):
+        normal, hover = self._button_images(text, colors, accent)
+        label = tk.Label(parent, image=normal, bd=0, highlightthickness=0,
+                         bg=colors["surface"], cursor="hand2")
+        label.bind("<Enter>", lambda e: label.configure(image=hover))
+        label.bind("<Leave>", lambda e: label.configure(image=normal))
+        label.bind("<Button-1>", lambda e: command())
+        return label
+
+    # -- lifecycle ---------------------------------------------------------
     def destroy(self):
         try:
             self.win.destroy()
@@ -1067,6 +1279,7 @@ class Flyout(object):
     def _clear(self):
         for child in self.body.winfo_children():
             child.destroy()
+        self._images = []
 
     def refresh(self, usage):
         if not self.visible:
@@ -1074,77 +1287,118 @@ class Flyout(object):
         self.render(usage)
 
     def render(self, usage):
-        f = self.app.cfg["flyout"]
-        fam, fs, ts = f["font_family"], f["font_size"], f["title_size"]
+        colors = self.theme()
+        cfg = self.app.cfg["flyout"] or {}
         self._clear()
-        width = int(f["width"])
+        pad = self.px(16)
+        width = self.px(int(cfg.get("width", 340)))
+        content = width - 2 * pad
 
-        header = tk.Frame(self.body, bg=f["background"])
+        self.win.configure(bg=colors["border"])
+        self.outer.configure(bg=colors["surface"])
+        self.body.configure(bg=colors["surface"], padx=pad, pady=pad)
+
+        def label(parent, text, size=13, weight="normal", color=None, **pack):
+            widget = tk.Label(parent, text=text, bg=colors["surface"],
+                              fg=color or colors["text"], font=self.font(size, weight),
+                              anchor="w", justify="left")
+            widget.pack(**pack)
+            return widget
+
+        header = tk.Frame(self.body, bg=colors["surface"])
         header.pack(fill="x")
-        tk.Label(header, text="Claude usage", bg=f["background"], fg=f["foreground"],
-                 font=(fam, ts, "bold")).pack(side="left")
-        stamp = usage.updated.strftime("%H:%M:%S") if usage.updated else "-"
-        tk.Label(header, text=stamp, bg=f["background"], fg=f["muted"],
-                 font=(fam, fs)).pack(side="right")
+        label(header, "Claude usage", size=16, weight="bold", side="left")
+        stamp = "Updated %s" % usage.updated.strftime("%H:%M") if usage.updated else "No data yet"
+        label(header, stamp, size=12, color=colors["muted"], side="right")
 
         if usage.error:
-            tk.Label(self.body, text="Status: %s" % usage.error, bg=f["background"],
-                     fg="#F85149", font=(fam, fs)).pack(anchor="w", pady=(8, 0))
+            note = tk.Frame(self.body, bg=colors["surface"])
+            note.pack(fill="x", pady=(self.px(10), 0))
+            text = usage.error
+            if self.app.retry_at and time.time() < self.app.retry_at:
+                text += " · retrying in %s" % human_delta(
+                    datetime.fromtimestamp(self.app.retry_at, timezone.utc))
+            label(note, text, size=12, color=colors["caution"], anchor="w", fill="x")
 
         for lim in usage.limits:
-            pct = lim["percent"]
-            col = color_for(pct, self.app.cfg["thresholds"])
-            row = tk.Frame(self.body, bg=f["background"])
-            row.pack(fill="x", pady=(10, 0))
-            tk.Label(row, text=lim["label"], bg=f["background"], fg=f["foreground"],
-                     font=(fam, fs)).pack(side="left")
-            tk.Label(row, text="%d%%" % round(pct), bg=f["background"], fg=col,
-                     font=(fam, fs, "bold")).pack(side="right")
-            cv = tk.Canvas(self.body, width=width, height=8, bg=f["track_color"],
-                           highlightthickness=0, bd=0)
-            cv.pack(fill="x", pady=(4, 0))
-            cv.create_rectangle(0, 0, width * min(pct, 100) / 100.0, 8, fill=col, outline="")
+            pct = float(lim["percent"])
+            color = self.severity_color(pct, colors)
+            row = tk.Frame(self.body, bg=colors["surface"])
+            row.pack(fill="x", pady=(self.px(14), 0))
+            label(row, lim["label"], size=13, side="left")
+            label(row, "%d%%" % round(pct), size=13, weight="bold", color=color, side="right")
+
+            bar = tk.Label(self.body, image=self._bar(content, pct, color, colors),
+                           bd=0, highlightthickness=0, bg=colors["surface"])
+            bar.pack(fill="x", pady=(self.px(6), 0))
+
             reset = parse_reset(lim["resets_at"])
             if reset:
-                tk.Label(self.body,
-                         text="resets %s  (in %s)" % (reset.strftime("%a %H:%M"), human_delta(reset)),
-                         bg=f["background"], fg=f["muted"], font=(fam, fs - 1)).pack(anchor="w")
+                label(self.body,
+                      "Resets %s · in %s" % (reset.strftime("%a %H:%M"), human_delta(reset)),
+                      size=12, color=colors["muted"], anchor="w", fill="x",
+                      pady=(self.px(4), 0))
 
         extra = usage.extra or {}
         if extra.get("is_enabled"):
-            tk.Label(self.body, text="Extra usage: %s%% of monthly limit"
-                     % round(float(extra.get("utilization") or 0)),
-                     bg=f["background"], fg=f["muted"], font=(fam, fs)).pack(anchor="w", pady=(10, 0))
+            label(self.body, "Extra usage: %d%% of the monthly limit"
+                  % round(float(extra.get("utilization") or 0)),
+                  size=12, color=colors["muted"], anchor="w", fill="x",
+                  pady=(self.px(12), 0))
 
-        footer = tk.Frame(self.body, bg=f["background"])
-        footer.pack(fill="x", pady=(14, 0))
-        for text, cmd in (("Refresh", self.app.start_fetch),
-                          ("Config", lambda: os.startfile(CONFIG_PATH)),
-                          ("Close", self.hide)):
-            tk.Label(footer, text=text, bg=f["background"], fg=f["accent"],
-                     font=(fam, fs), cursor="hand2").pack(side="left", padx=(0, 14))
-            footer.winfo_children()[-1].bind("<Button-1>", lambda e, c=cmd: c())
+        divider = tk.Frame(self.body, bg=colors["divider"], height=1)
+        divider.pack(fill="x", pady=(self.px(16), 0))
+
+        footer = tk.Frame(self.body, bg=colors["surface"])
+        footer.pack(fill="x", pady=(self.px(12), 0))
+        self._button(footer, "Refresh", lambda: self.app.start_fetch(manual=True),
+                     colors, accent=True).pack(side="left")
+        self._button(footer, "Usage page",
+                     lambda: webbrowser.open(self.app.cfg.get("usage_page_url")),
+                     colors).pack(side="left", padx=(self.px(8), 0))
+        self._button(footer, "Settings", lambda: os.startfile(CONFIG_PATH),
+                     colors).pack(side="left", padx=(self.px(8), 0))
 
     def show(self, usage):
-        f = self.app.cfg["flyout"]
+        cfg = self.app.cfg["flyout"] or {}
+        self.scale = ui_scale()
         self.render(usage)
         self.win.update_idletasks()
         w = self.win.winfo_reqwidth()
         h = self.win.winfo_reqheight()
-        # bottom-right, above the taskbar, using the work area
+
         rect = wt.RECT()
         user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0)  # SPI_GETWORKAREA
-        ox, oy = f.get("corner_offset", [12, 12])
+        ox, oy = cfg.get("corner_offset", [12, 12])
+        ox, oy = self.px(int(ox)), self.px(int(oy))
         if getattr(self.app, "flyout_anchor", "right") == "left":
-            x = rect.left + int(ox)
+            x = rect.left + ox
         else:
-            x = rect.right - w - int(ox)
-        y = rect.bottom - h - int(oy)
+            x = rect.right - w - ox
+        y = rect.bottom - h - oy
         self.win.geometry("%dx%d+%d+%d" % (w, h, x, y))
+
+        self.win.attributes("-alpha", 0.0)
         self.win.deiconify()
         self.win.lift()
         self.win.focus_force()
         self.visible = True
+        if self._hwnd is None:
+            self._hwnd = user32.GetParent(self.win.winfo_id()) or self.win.winfo_id()
+        round_window_corners(self._hwnd)
+        self._fade(0.0)
+
+    def _fade(self, value):
+        """Windows fades its flyouts in; a window that just appears feels wrong."""
+        if not self.visible:
+            return
+        value = min(1.0, value + 0.2)
+        try:
+            self.win.attributes("-alpha", value)
+        except Exception:
+            return
+        if value < 1.0:
+            self.win.after(16, lambda: self._fade(value))
 
     def hide(self):
         self.win.withdraw()
@@ -1238,6 +1492,22 @@ user32.ReleaseDC.argtypes = [wt.HWND, wt.HDC]
 CLR_INVALID = 0xFFFFFFFF
 
 
+def short_error(error):
+    """The overlay has room for a word, not a sentence."""
+    if not error:
+        return None
+    lowered = str(error).lower()
+    if "rate limited" in lowered:
+        return "paused"
+    if "offline" in lowered:
+        return "offline"
+    if "signed" in lowered or "sign in" in lowered:
+        return "sign in"
+    if "loading" in lowered:
+        return "…"
+    return "no data"
+
+
 def blend(a, b, t):
     return tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
 
@@ -1265,6 +1535,17 @@ def sample_taskbar_color(rect, x_from, x_to):
         return (best & 0xFF, (best >> 8) & 0xFF, (best >> 16) & 0xFF)
     finally:
         user32.ReleaseDC(None, hdc)
+
+
+def windows_accent_color():
+    """The user's accent colour, as Windows stores it (ABGR)."""
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\\Microsoft\\Windows\\DWM")
+        with key:
+            value = int(winreg.QueryValueEx(key, "AccentColor")[0]) & 0xFFFFFF
+        return "#%02X%02X%02X" % (value & 0xFF, (value >> 8) & 0xFF, (value >> 16) & 0xFF)
+    except Exception:
+        return "#0F6CBD"
 
 
 def windows_uses_light_theme():
@@ -1334,7 +1615,7 @@ class TaskbarWidget(object):
         if action == "flyout":
             self.app.toggle_flyout()
         elif action == "refresh":
-            self.app.start_fetch()
+            self.app.start_fetch(manual=True)
         elif action == "web":
             webbrowser.open(self.app.cfg.get("usage_page_url"))
         return "break"
@@ -1454,14 +1735,16 @@ class TaskbarWidget(object):
         limit = usage.by_key(key)
         pct = float(limit["percent"]) if limit else 0.0
         reset = parse_reset(limit["resets_at"]) if limit else None
-        state = (round(pct, 1), human_delta(reset), usage.error, self.geometry,
+        # Keep showing the last known figures; the flyout explains the trouble.
+        error = None if limit else short_error(usage.error)
+        state = (round(pct, 1), human_delta(reset), error, self.geometry,
                  self._taskbar_bg(), windows_uses_light_theme())
         if state == self._last_key:
             return
         self._last_key = state
 
         _, _, w, h = self.geometry
-        image = self._render(w, h, pct, reset, usage.error)
+        image = self._render(w, h, pct, reset, error)
         self.photo = ImageTk.PhotoImage(image)
         bg = self._colors()[0]
         self.label.configure(image=self.photo, bg=bg)

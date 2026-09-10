@@ -39,7 +39,10 @@ widgets-board provider, but that one can only ever appear inside the Win+W panel
 ### Interaction
 
 * **Hover** — tooltip with both percentages and the reset countdown.
-* **Left click** — flyout with every limit, a bar each, and reset times.
+* **Left click** — a Windows 11 style flyout: system surface colour, rounded
+  corners (DWM), the accent colour on the primary button, Segoe UI Variable, and
+  it fades in and closes when you click away. It follows the Windows light/dark
+  setting on its own.
 * **Right click** — menu: refresh, edit/reload config, open the web usage page,
   open the log, toggle "Start with Windows", quit.
 * **Balloon notification** when the session crosses 80% and 95% - once per
@@ -214,9 +217,18 @@ threshold per limit window, and re-arms when the window resets.
 
 ### `flyout`
 
-`width`, `background`, `foreground`, `muted`, `accent`, `track_color`,
-`font_family`, `font_size`, `title_size`, `corner_offset` (`[x, y]` from the
-bottom-right of the work area), `close_on_focus_loss`.
+| Key | Meaning |
+| --- | --- |
+| `width` | Panel width in logical pixels; scaled for DPI. |
+| `theme` | `auto` follows the Windows app theme, or force `light` / `dark`. |
+| `accent` | `auto` uses your Windows accent colour for the primary button, or a hex colour. |
+| `corner_offset` | `[x, y]` distance from the work-area corner. |
+| `close_on_focus_loss` | Close when you click elsewhere, like a system flyout. |
+
+Colours inside the panel come from the Windows 11 Fluent palette rather than
+`config.json`, so the panel matches the OS in either theme. The severity colours
+still track the `thresholds` you configure — the ranks map onto the Fluent
+success / caution / critical colours.
 
 ## Recipes
 
@@ -264,7 +276,13 @@ bottom-right of the work area), `close_on_focus_loss`.
 * If the token expires, the icon keeps the last good numbers and the tooltip says
   `auth` — running any Claude Code command refreshes the credentials file and the
   next poll picks it up automatically.
-* Network blips show `offline` in the tooltip without wiping the displayed numbers.
+* Network blips show `offline` without wiping the displayed numbers, and the last
+  good figures are cached to `.usage_cache.json`, so a restart shows numbers
+  immediately instead of an empty panel.
+* An HTTP 429 from the usage endpoint backs the poller off (2 minutes, doubling
+  up to 30) instead of retrying every minute; the overlay keeps showing the last
+  figures and the flyout says when the next attempt is. **Refresh** ignores the
+  backoff.
 * The icon re-registers itself if Explorer restarts; the overlay re-reads the
   taskbar's geometry twice a second, so it follows moves, resizes and DPI changes.
 * Notifications fire once per threshold per reset window — sitting at 100% does
