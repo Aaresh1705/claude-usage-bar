@@ -1578,6 +1578,7 @@ user32.GetWindow.argtypes = [wt.HWND, wt.UINT]
 user32.GetTopWindow.restype = wt.HWND
 user32.GetTopWindow.argtypes = [wt.HWND]
 user32.IsWindow.argtypes = [wt.HWND]
+user32.IsZoomed.argtypes = [wt.HWND]
 user32.MonitorFromWindow.restype = wt.HANDLE
 user32.MonitorFromWindow.argtypes = [wt.HWND, wt.DWORD]
 user32.MonitorFromPoint.restype = wt.HANDLE
@@ -1599,6 +1600,15 @@ def taskbar_info():
         return None
     state = shell32.SHAppBarMessage(ABM_GETSTATE, ctypes.byref(data))
     return data.rc, data.uEdge, bool(state & ABS_AUTOHIDE)
+
+
+def monitor_work_area(hwnd):
+    mi = MONITORINFO()
+    mi.cbSize = ctypes.sizeof(MONITORINFO)
+    monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+    if not monitor or not user32.GetMonitorInfoW(monitor, ctypes.byref(mi)):
+        return None
+    return mi.rcWork
 
 
 def monitor_rect_of(hwnd):
@@ -1645,14 +1655,17 @@ def foreground_is_fullscreen(taskbar_rect=None):
               and rect.right >= m.right and rect.bottom >= m.bottom)
     if not covers:
         return False
-    # A merely maximised window covers the monitor too whenever the work area
-    # is the whole monitor - an auto-hiding taskbar, or a second screen without
-    # one. Real fullscreen drops the caption and the resize frame; keeping the
-    # test on the style rather than on the placement also catches the
-    # borderless-fullscreen games that stay SW_SHOWMAXIMIZED.
-    style = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)(hwnd, GWL_STYLE)
-    if style & (WS_CAPTION | WS_THICKFRAME):
-        return False
+    # A maximised window stops at the work area, so with a normal taskbar the
+    # test above has already excluded it - covering the strip the taskbar is on
+    # means fullscreen. Only when the work area IS the whole monitor (an
+    # auto-hiding taskbar, or a second screen without one) do the two look
+    # alike, and there the window placement separates them. Testing the window
+    # style instead was wrong: browsers keep WS_THICKFRAME in fullscreen, so a
+    # fullscreen video stopped hiding the overlay.
+    work = monitor_work_area(hwnd)
+    if work is not None and (work.right - work.left, work.bottom - work.top) ==             (m.right - m.left, m.bottom - m.top):
+        if user32.IsZoomed(hwnd):
+            return False
     if taskbar_rect is not None:
         # Only our own monitor matters.
         centre = wt.POINT(int((taskbar_rect.left + taskbar_rect.right) / 2),
@@ -1702,9 +1715,16 @@ def windows_uses_light_theme():
 
 
 def fade_image(image, factor):
-    """Scale an image's alpha - used to dim numbers that are no longer live."""
+    """Scale an image's alpha - used to dim numbers that are no longer live.
+
+    Anything that was visible at all stays at alpha 1 or more: the widget's
+    whole rectangle is covered by an alpha-1 veil so that clicks land on it, and
+    rounding that veil down to zero would make everything but the glyphs
+    click-through.
+    """
     r, g, b, a = image.split()
-    return Image.merge("RGBA", (r, g, b, a.point(lambda v: int(v * factor))))
+    return Image.merge("RGBA", (r, g, b,
+                                a.point(lambda v: max(1, int(round(v * factor))) if v else 0)))
 
 
 def premultiply(image):
@@ -1750,8 +1770,6 @@ class TaskbarWidget(object):
         self._busy_until = 0.0
         self._reassert = 0
         self.owner = None
-        self._last_foreground = None
-        self._last_busy = (False, False)
         self._create()
 
     # -- window ------------------------------------------------------------
@@ -1965,14 +1983,12 @@ class TaskbarWidget(object):
         taskbar_rect = info[0] if info else None
 
         if bool(c.get("hide_on_fullscreen", True)):
-            # Both questions are about the foreground window; while that hasn't
-            # changed, the previous answer still holds.
-            foreground = user32.GetForegroundWindow()
-            if foreground == self._last_foreground:
-                busy, fullscreen = self._last_busy
-            else:
-                busy, fullscreen = user_is_busy(), foreground_is_fullscreen(taskbar_rect)
-                self._last_foreground, self._last_busy = foreground, (busy, fullscreen)
+            # Asked every tick, deliberately: a window going fullscreen keeps
+            # its handle, so caching the answer against the foreground window
+            # meant a video that went fullscreen in an already-focused browser
+            # was never noticed.
+            busy = user_is_busy()
+            fullscreen = foreground_is_fullscreen(taskbar_rect)
             if busy or fullscreen:
                 self._busy_until = time.time() + float(c.get("fullscreen_grace_ms", 900)) / 1000.0
                 self._hide("busy" if busy else "fullscreen")
