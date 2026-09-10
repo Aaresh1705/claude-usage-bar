@@ -82,16 +82,18 @@
       0
     ],
     "padding": 5,
-    "background": "auto",
     "text_color": "auto",
-    "muted_color": "#9BA0A6",
+    "muted_color": "auto",
     "font_file": "segoeui.ttf",
     "bold_font_file": "segoeuib.ttf",
     "show_bar": true,
     "show_reset": true,
     "bar_height": 4,
-    "track_color": "auto",
     "hide_on_fullscreen": true,
-    "supersample": 3
+    "supersample": 3,
+    "background": "transparent",
+    "corner_radius": 6,
+    "fullscreen_grace_ms": 900,
+    "fade_ms": 160
   }
 }

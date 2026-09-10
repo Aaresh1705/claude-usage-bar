@@ -45,8 +45,11 @@ widgets-board provider, but that one can only ever appear inside the Win+W panel
   setting on its own.
 * **Right click** — menu: refresh, edit/reload config, open the web usage page,
   open the log, toggle "Start with Windows", quit.
-* **Balloon notification** when the session crosses 80% and 95% - once per
-  threshold per reset window, never a repeat while you sit at the limit.
+* **Notification** when the session crosses 80% and 95% - once per threshold per
+  reset window, never a repeat while you sit at the limit. With tray icons on
+  that is a normal tray balloon; with the tray off there is no icon to hang one
+  on, so the app draws its own Fluent toast above the corner instead. Neither
+  appears while Windows says you are busy (a game, a call, a presentation).
 * **Skull** instead of a number at 100%: the pill can only ever show two
   digits, so "100" used to render as "99". The skull is drawn by hand
   (`draw_skull`), not an emoji, so it stays crisp at 16px. Set
@@ -115,9 +118,23 @@ you can keep a minimal file with just your overrides.
 
 ### `taskbar_widget`
 
-The overlay. It follows the taskbar's position, height and DPI, samples the
-taskbar's own colour so it blends in, re-asserts itself above the taskbar every
-half second, and hides while a fullscreen app is in front.
+The overlay. It is a **layered window**: `UpdateLayeredWindow` hands DWM a bitmap
+with per-pixel alpha, so nothing paints a background at all — the real taskbar,
+with its acrylic tint and the gradient it picks up from your wallpaper, simply
+shows through. That is a deliberate change from the first version, which sampled
+the taskbar's colour with `GetPixel` and filled a rectangle with it: the taskbar
+is not one colour (measured here: it varies by ~7 RGB levels across its own
+width), so a flat fill can only ever match at the point it was sampled.
+
+Two more consequences of the layered window: updates arrive as one composited
+frame, which is why it no longer flickers, and the whole rectangle is painted at
+alpha 1 — invisible, but enough for `UpdateLayeredWindow`'s alpha hit-testing to
+route clicks to the widget rather than through it.
+
+Z-order is held by answering `WM_WINDOWPOSCHANGING` (forcing `hwndInsertAfter`
+back to `HWND_TOPMOST`) instead of calling `SetWindowPos` on a half-second timer.
+The timer version was what made the widget blink when a menu opened or a program
+launched. A `SetWindowPos` remains as a safety net, every ten seconds.
 
 | Key | Meaning |
 | --- | --- |
@@ -127,15 +144,24 @@ half second, and hides while a fullscreen app is in front.
 | `width` | Width in logical pixels at 100% DPI; scaled with the taskbar. |
 | `offset` | `[x, y]` nudge from the corner, also DPI-scaled. |
 | `padding` | Gap above and below, so it doesn't touch the taskbar edges. |
-| `background` | `auto` samples the taskbar next to the overlay. A hex colour pins it. |
-| `text_color` / `muted_color` | The number and the countdown. `auto` follows the Windows theme. |
-| `track_color` | `auto` tints the taskbar colour towards the text colour. |
+| `background` | `transparent` (default) draws straight onto the taskbar. A hex colour paints a pill behind the content instead. |
+| `background_alpha`, `corner_radius` | Only used when `background` is a colour. |
+| `text_color` / `muted_color` | `auto` follows the Windows theme. |
 | `show_bar`, `bar_height` | The progress bar under the countdown. |
 | `show_reset` | The reset countdown. Drop it to save width. |
 | `hide_on_fullscreen` | Get out of the way of games and full-screen video. |
+| `fullscreen_grace_ms` | How long to wait after fullscreen ends before coming back (default 900). Without it the overlay reappears while the desktop is still repainting and is briefly the only thing on screen. |
+| `fade_ms` | Fade-in when it reappears (default 160). |
 | `supersample` | Render scale for the text; 3 is plenty. |
 
-At 100% the number is replaced by the same drawn skull the tray uses.
+Severity colours follow your `thresholds` but are drawn from the Fluent palette,
+so they stay legible on both a light and a dark taskbar. At 100% the number is
+replaced by the same drawn skull the tray uses.
+
+Fullscreen detection asks Windows itself (`SHQueryUserNotificationState`, the
+signal that also holds back system toasts) and additionally compares the
+foreground window to its monitor — and only to *our* monitor, so a video playing
+full-screen on a second display no longer blanks the overlay on the first.
 
 **Limits worth knowing.** With the taskbar centred, the left corner is free until
 you have a lot of windows open — Windows will happily slide app buttons under the
