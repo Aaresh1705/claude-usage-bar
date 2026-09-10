@@ -118,28 +118,27 @@ you can keep a minimal file with just your overrides.
 
 ### `taskbar_widget`
 
-The overlay. It is a **layered window owned by the taskbar**, and both halves of
-that matter.
+The overlay is a **layered window that is a child of the taskbar** - created as
+a popup and handed to `Shell_TrayWnd` with `SetParent` (Windows refuses to create
+it as a child outright). That one decision does all the work: the widget is
+exactly as visible as the taskbar, no more and no less. Whatever covers the
+taskbar covers the widget - a fullscreen video, Task View - and whatever leaves the
+taskbar alone leaves the widget alone: clicking the taskbar, opening Start, an
+auto-hiding taskbar sliding away. None of that is detected in code; Windows does
+it, because the widget is part of the taskbar's own window tree.
 
 *Layered* (`UpdateLayeredWindow`, per-pixel alpha) means nothing paints a
-background at all - the real taskbar, with its acrylic tint and the gradient it
-picks up from your wallpaper, shows through. The first version sampled the
-taskbar's colour with `GetPixel` and filled a rectangle with it, which can only
-ever match at the point it was sampled: measured here, the taskbar varies by
-about 7 RGB levels across its own width. Updates also arrive as one composited
-frame, so it does not flicker on redraw.
+background - the real taskbar, acrylic tint and all, shows through around the
+glyphs, and each frame lands as one composited update, so nothing flickers.
 
-*Owned by the taskbar* is what keeps it in place. A plain topmost window loses
-its position the moment you click the taskbar - measured: demoted below it within
-5ms, and blank for about 300ms until something noticed - and it is hidden
-entirely while the Start menu is open. Windows keeps an **owned** window in front
-of its owner, so both problems disappear at the source: measured 0 blank frames
-across four taskbar clicks, and the widget stays visible with Start open. It
-costs nothing to maintain - no z-order polling, no timers fighting the shell -
-and the widget still receives its own clicks.
+Earlier versions were a topmost window floating over the taskbar. That version
+fought the shell: clicking the taskbar demoted it (a ~300ms blink), the Start
+menu hid it, and it needed its own fullscreen detection and z-order polling to
+paper over both. All of that is gone.
 
-The trade-off is that an owned window dies with its owner, so an Explorer restart
-takes the widget with it; the tick notices within half a second and rebuilds it.
+The one thing a child inherits is its parent's fate: an Explorer restart destroys
+the taskbar and its children with it. The tick notices within half a second and
+rebuilds, backing off if the shell is not back yet.
 
 | Key | Meaning |
 | --- | --- |
@@ -154,26 +153,20 @@ takes the widget with it; the tick notices within half a second and rebuilds it.
 | `text_color` / `muted_color` | `auto` follows the Windows theme. |
 | `show_bar`, `bar_height` | The progress bar under the countdown. |
 | `show_reset` | The reset countdown. Drop it to save width. |
-| `hide_on_fullscreen` | Get out of the way of games and full-screen video. |
-| `fullscreen_grace_ms` | How long to wait after fullscreen ends before coming back (default 900). Without it the overlay reappears while the desktop is still repainting and is briefly the only thing on screen. |
 | `stale_opacity` | Opacity for numbers that stopped being refreshed - rate limited, offline, signed out (default 0.55). |
-| `fade_ms` | Fade-in when it reappears (default 160). |
 | `supersample` | Render scale for the text; 3 is plenty. |
 
-Severity colours follow your `thresholds` but are drawn from the Fluent palette,
-so they stay legible on both a light and a dark taskbar. At 100% the number is
-replaced by the same drawn skull the tray uses.
+Severity colours are the ones in `thresholds` (vivid green, amber and red by
+default). At 100% the number is replaced by the same drawn skull the tray uses.
 
 Fullscreen detection asks Windows itself (`SHQueryUserNotificationState`, the
 signal that also holds back system toasts) and additionally compares the
 foreground window to its monitor — and only to *our* monitor, so a video playing
 full-screen on a second display no longer blanks the overlay on the first.
 
-**What still covers it.** Task View (Win+Tab) draws above everything and hides
-the widget while it is open; it returns when you leave. The Start menu, Search,
-the notification centre and quick settings do not, thanks to the ownership above.
-Neither does anything ordinary: clicking the taskbar, the desktop, another
-window, or this app's own menu and flyout.
+**What covers it.** Exactly what covers the taskbar: a fullscreen app or video,
+and Task View. Start, Search, the notification centre and quick settings leave the
+taskbar visible, so they leave the widget visible too.
 
 **Limits worth knowing.** With the taskbar centred, the left corner is free until
 you have a lot of windows open — Windows will happily slide app buttons under the
@@ -335,9 +328,8 @@ success / caution / critical colours.
   while the app kept running and looking healthy.
 * Numbers that stopped being refreshed are dimmed rather than shown as if live,
   and the on-disk cache is ignored once it is more than 12 hours old.
-* A window that is merely maximised is no longer mistaken for a fullscreen one -
-  which used to hide the overlay permanently for anyone with an auto-hiding
-  taskbar, since the work area then equals the whole monitor.
+* There is no fullscreen detection any more: as a child of the taskbar the widget
+  is hidden by exactly what hides the taskbar, so there is nothing to detect.
 * `/api/oauth/usage` is the endpoint Claude Code's own `/usage` uses. It is not a
   documented public API, so treat the shape as something that can change; the parser
   falls back to the older `five_hour` / `seven_day` fields if the `limits` array

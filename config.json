@@ -37,15 +37,15 @@
   "thresholds": [
     {
       "at": 0,
-      "color": "#3FB950"
+      "color": "#22C55E"
     },
     {
       "at": 60,
-      "color": "#D29922"
+      "color": "#F59E0B"
     },
     {
       "at": 85,
-      "color": "#F85149"
+      "color": "#EF4444"
     }
   ],
   "tooltip_template": "Claude \u00b7 {primary_label}: {primary}%\n{secondary_label}: {secondary}%\nResets {primary_reset_short} (in {primary_reset_in})",
@@ -89,11 +89,9 @@
     "show_bar": true,
     "show_reset": true,
     "bar_height": 4,
-    "hide_on_fullscreen": true,
     "supersample": 3,
     "background": "transparent",
     "corner_radius": 6,
-    "fullscreen_grace_ms": 900,
-    "fade_ms": 160
+    "background_alpha": 255
   }
 }
