@@ -1,0 +1,78 @@
+{
+  "refresh_seconds": 60,
+  "primary_metric": "session",
+  "secondary_metric": "weekly_all",
+  "icon": {
+    "style": "bar_text",
+    "orientation": "horizontal",
+    "margin": 1,
+    "corner_radius": 2,
+    "track_color": "#4A4A4A",
+    "track_alpha": 200,
+    "text_color": "#FFFFFF",
+    "text_shadow": true,
+    "font_file": "segoeuib.ttf",
+    "font_scale": 0.78,
+    "bar_thickness": 0.3,
+    "ring_thickness": 0.22,
+    "show_secondary": true,
+    "secondary_thickness": 0.14,
+    "secondary_color": "#7A7AFF",
+    "gap": 0.08,
+    "supersample": 8,
+    "skull_at": 100,
+    "count": 0,
+    "reverse_segments": true,
+    "label_format": "{pct}",
+    "segment_mode": "cells",
+    "segments": [
+      "text",
+      "bar",
+      "bar",
+      "bar",
+      "bar",
+      "bar"
+    ]
+  },
+  "thresholds": [
+    {
+      "at": 0,
+      "color": "#3FB950"
+    },
+    {
+      "at": 60,
+      "color": "#D29922"
+    },
+    {
+      "at": 85,
+      "color": "#F85149"
+    }
+  ],
+  "tooltip_template": "Claude · {primary_label}: {primary}%\n{secondary_label}: {secondary}%\nResets {primary_reset_short} (in {primary_reset_in})",
+  "notifications": {
+    "enabled": true,
+    "at": [
+      80,
+      95
+    ],
+    "metric": "session"
+  },
+  "flyout": {
+    "width": 340,
+    "background": "#1E1E1E",
+    "foreground": "#E6E6E6",
+    "muted": "#9A9A9A",
+    "accent": "#C96442",
+    "track_color": "#3A3A3A",
+    "font_family": "Segoe UI",
+    "font_size": 9,
+    "title_size": 11,
+    "corner_offset": [
+      12,
+      12
+    ],
+    "close_on_focus_loss": true
+  },
+  "left_click": "flyout",
+  "usage_page_url": "https://claude.ai/settings/usage"
+}
