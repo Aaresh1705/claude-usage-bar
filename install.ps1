@@ -4,10 +4,11 @@
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -Update      git pull, then restart
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall   stop + remove (keeps config.json)
 #
-# It works either way round: next to ClaudeUsageBar.exe it uses the exe, and in
-# a clone of the repository it runs the Python source with pythonw.
+# It works either way round: in a clone it runs the Python source with pythonw,
+# and where only ClaudeUsageBar.exe was copied it uses that. Add -Exe to prefer
+# the exe even in a clone.
 
-param([switch]$Uninstall, [switch]$Update, [switch]$NoStart)
+param([switch]$Uninstall, [switch]$Update, [switch]$NoStart, [switch]$Exe)
 
 $ErrorActionPreference = 'Stop'
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -15,8 +16,16 @@ $lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Claude Usage Bar.lnk
 $source = Join-Path $dir 'claude_usage_bar.pyw'
 $icon = Join-Path $dir 'assets\ClaudeUsageBar.ico'
 
-$exe = @((Join-Path $dir 'ClaudeUsageBar.exe'), (Join-Path $dir 'dist\ClaudeUsageBar.exe')) |
-       Where-Object { Test-Path $_ } | Select-Object -First 1
+# The source wins when it is there: a clone is meant to run from source, and on
+# a machine with Windows Defender Application Control enforced an unsigned exe
+# cannot start at all. -Exe forces the exe when you want to test it.
+# (The variable is $exePath, not $exe: PowerShell variable names are
+# case-insensitive, so $exe and the -Exe switch would be the same variable.)
+$exePath = $null
+if ($Exe -or -not (Test-Path $source)) {
+    $exePath = @((Join-Path $dir 'ClaudeUsageBar.exe'), (Join-Path $dir 'dist\ClaudeUsageBar.exe')) |
+           Where-Object { Test-Path $_ } | Select-Object -First 1
+}
 
 function Stop-App {
     Get-CimInstance Win32_Process -Filter "Name='ClaudeUsageBar.exe'" -ErrorAction SilentlyContinue |
@@ -44,10 +53,10 @@ if ($Update) {
 }
 
 # --- how are we going to run it? ---------------------------------------------
-if ($exe) {
-    $target = $exe
+if ($exePath) {
+    $target = $exePath
     $arguments = ''
-    Write-Host "Using $exe"
+    Write-Host "Using $exePath"
 } else {
     if (-not (Test-Path $source)) { throw "Neither ClaudeUsageBar.exe nor claude_usage_bar.pyw is in $dir." }
 
@@ -92,10 +101,27 @@ Write-Host "Starts with Windows: $lnk"
 
 Stop-App
 if (-not $NoStart) {
-    if ($arguments) {
-        Start-Process -FilePath $target -ArgumentList $arguments -WorkingDirectory $dir -WindowStyle Hidden
-    } else {
-        Start-Process -FilePath $target -WorkingDirectory $dir -WindowStyle Hidden
+    try {
+        if ($arguments) {
+            Start-Process -FilePath $target -ArgumentList $arguments -WorkingDirectory $dir -WindowStyle Hidden
+        } else {
+            Start-Process -FilePath $target -WorkingDirectory $dir -WindowStyle Hidden
+        }
+    } catch {
+        $guard = 0
+        try {
+            $guard = (Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard `
+                      -ClassName Win32_DeviceGuard).CodeIntegrityPolicyEnforcementStatus
+        } catch { }
+        if ($exePath -and $guard -eq 2) {
+            throw @'
+Windows refused to start the exe. This machine runs Windows Defender Application
+Control in enforcement mode, which will not launch an unsigned executable from
+any user-writable folder, wherever you put it. Use the source instead: clone the
+repository and run install.ps1 there without -Exe (Python is signed, so it runs).
+'@
+        }
+        throw
     }
     Write-Host 'Running. Look at the left end of your taskbar.'
     Write-Host ''
