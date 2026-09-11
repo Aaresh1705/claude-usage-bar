@@ -404,4 +404,9 @@ success / caution / critical colours.
 | `make_preview.py` | Redraws `preview.png` by calling the widget's own renderer, so the README picture cannot drift from the app. |
 | `preview.png` | The widget at 14%, 72%, 96%, 100% and rate-limited, light and dark. |
 | `assets/` | The app icon. |
+| `LICENSE` | MIT. |
 | `.icons/` | Generated `.ico` files (throwaway). |
+
+## Licence
+
+MIT - see [LICENSE](LICENSE).
