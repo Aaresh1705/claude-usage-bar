@@ -52,8 +52,10 @@ widgets-board provider, but that one can only ever appear inside the Win+W panel
   appears while Windows says you are busy (a game, a call, a presentation).
 * **Skull** instead of a number at 100%: the pill can only ever show two
   digits, so "100" used to render as "99". The skull is drawn by hand
-  (`draw_skull`), not an emoji, so it stays crisp at 16px. Set
-  `icon.skull_at` to another percentage, or `null` to keep the number.
+  (`draw_skull`), not an emoji, so it stays crisp at 16px. It follows the
+  Windows theme - near-black on light, near-white on dark - rather than the
+  threshold colour. Set `icon.skull_at` to another percentage, or `null` to
+  keep the number, and `icon.skull_color` to pin the colour.
 
 ## Install
 
@@ -76,8 +78,17 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
 That installs `pillow`/`requests` if they are missing, writes a `config.json`
-with the defaults, creates a Startup shortcut that runs it hidden under
-`pythonw.exe`, and starts it.
+with the defaults, registers a **scheduled task** that starts it ten seconds
+after you sign in, and starts it now.
+
+It is a task rather than a shortcut in the Startup folder for a reason. The
+Startup folder is the last thing the shell gets to: measured on the machine this
+was written on, the app launched **170 seconds after boot**, queued behind Teams,
+OneDrive, Spotify and a Java updater - long enough that it looks like it never
+started at all. The task does not wait in that queue, and it retries three times
+if it fails. Use `-UseStartupFolder` if you would rather have the old shortcut,
+and the installer falls back to it by itself if your machine's policy forbids
+registering tasks.
 
 To update later:
 
@@ -110,7 +121,8 @@ denied" no matter where you put it (check with
 powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall
 ```
 
-Stops it and deletes the Startup shortcut. `config.json` and the log stay.
+Stops it and removes the scheduled task (and the Startup shortcut, if you used
+one). `config.json` and the log stay.
 
 ## Configuration
 
@@ -142,6 +154,7 @@ you can keep a minimal file with just your overrides.
 | `reverse_segments` | Flip left-to-right order if Windows registers your icons backwards. |
 | `label_format` | Text in the number cell. `{pct}`, `{secondary}`, plus any literal text — e.g. `"{pct}%"`. |
 | `skull_at` | Percentage at which the number is replaced by a drawn skull. Default `100`; `null` keeps the number (which can only show two digits, so 100% reads as `99`). |
+| `skull_color` | Colour of that skull. Default `"auto"`: near-black (`#1A1A1A`) under the light Windows theme, near-white (`#F2F2F2`) under the dark one, so it reads against the taskbar instead of against the threshold colour. Give a hex colour to pin it. |
 | `text_cell_style` | Style used for a `text` segment: `text` (default), `bar_text`, `ring`. |
 | `cell_bar_thickness` | Bar height inside a `bar` segment, as a fraction of the icon. |
 | `use_guid` | Stable per-segment identity so Windows remembers tray promotion. Default on. |
@@ -198,7 +211,8 @@ rebuilds, backing off if the shell is not back yet.
 | `supersample` | Render scale for the text; 3 is plenty. |
 
 Severity colours are the ones in `thresholds` (vivid green, amber and red by
-default). At 100% the number is replaced by the same drawn skull the tray uses.
+default). At 100% the number is replaced by the same drawn skull the tray
+uses, inked in the widget's own text colour so it follows the Windows theme.
 
 Fullscreen detection asks Windows itself (`SHQueryUserNotificationState`, the
 signal that also holds back system toasts) and additionally compares the
@@ -337,9 +351,10 @@ success / caution / critical colours.
   `ERROR_ALREADY_EXISTS` is only honoured when the other instance's window
   actually answers — a leftover lock can't stop the app from starting again.
 * Every launch writes a `starting (pid …)` line to the log, so "it didn't come
-  back after a reboot" is answerable: a line means it started (look for what
-  followed), no line means Windows never launched it (check the Startup shortcut
-  and Task Manager → Startup apps).
+  back after a reboot" is answerable. A line means it started - compare its
+  timestamp with `(Get-CimInstance Win32_OperatingSystem).LastBootUpTime` to see
+  how long the shell took to get to it. No line at all means Windows never
+  launched it: check `Get-ScheduledTask 'Claude Usage Bar'`.
 * Dependencies are imported with a retry loop for the first minute — at logon the
   profile or site-packages can briefly be unavailable — and a failure is logged
   instead of killing the process silently.
@@ -383,7 +398,7 @@ success / caution / critical colours.
 | --- | --- |
 | `claude_usage_bar.pyw` | The whole app. |
 | `config.json` | Your settings, hot-reloaded. Not tracked by git: it is written from the defaults on first run, so it survives updates. |
-| `install.ps1` | Install, update (`-Update`), uninstall (`-Uninstall`). |
+| `install.ps1` | Install, update (`-Update`), uninstall (`-Uninstall`). Registers the logon task; `-UseStartupFolder` for the old shortcut. |
 | `build.ps1` | Builds the standalone `dist\ClaudeUsageBar.exe`. |
 | `make_icon.py` | Draws `assets\ClaudeUsageBar.ico` for the exe and the shortcut. |
 | `preview.png` | The widget at 14%, 72%, 96%, 100% and rate-limited, light and dark. |

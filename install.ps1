@@ -8,11 +8,12 @@
 # and where only ClaudeUsageBar.exe was copied it uses that. Add -Exe to prefer
 # the exe even in a clone.
 
-param([switch]$Uninstall, [switch]$Update, [switch]$NoStart, [switch]$Exe)
+param([switch]$Uninstall, [switch]$Update, [switch]$NoStart, [switch]$Exe, [switch]$UseStartupFolder)
 
 $ErrorActionPreference = 'Stop'
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Claude Usage Bar.lnk'
+$taskName = 'Claude Usage Bar'
 $source = Join-Path $dir 'claude_usage_bar.pyw'
 $icon = Join-Path $dir 'assets\ClaudeUsageBar.ico'
 
@@ -39,6 +40,9 @@ function Stop-App {
 if ($Uninstall) {
     Stop-App
     if (Test-Path $lnk) { Remove-Item $lnk -Force }
+    if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    }
     Write-Host 'Claude Usage Bar removed. config.json and your log were left alone.'
     return
 }
@@ -89,15 +93,50 @@ or use the prebuilt ClaudeUsageBar.exe, which needs no Python.
 }
 
 # --- start with Windows -------------------------------------------------------
-$shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
-$shortcut.TargetPath = $target
-$shortcut.Arguments = $arguments
-$shortcut.WorkingDirectory = $dir
-$shortcut.WindowStyle = 7
-$shortcut.Description = 'Claude usage on the taskbar'
-if (Test-Path $icon) { $shortcut.IconLocation = $icon }
-$shortcut.Save()
-Write-Host "Starts with Windows: $lnk"
+# A scheduled task rather than a Startup shortcut. The Startup folder is the
+# last thing the shell gets to: measured on this machine, 170 seconds after
+# boot, behind Teams, OneDrive, Spotify and a Java updater - long enough that
+# it looks like it never started. A logon task does not queue behind them.
+function Install-Shortcut {
+    $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+    $shortcut.TargetPath = $target
+    $shortcut.Arguments = $arguments
+    $shortcut.WorkingDirectory = $dir
+    $shortcut.WindowStyle = 7
+    $shortcut.Description = 'Claude usage on the taskbar'
+    if (Test-Path $icon) { $shortcut.IconLocation = $icon }
+    $shortcut.Save()
+    Write-Host "Starts with Windows (Startup folder): $lnk"
+}
+
+$installed = $false
+if (-not $UseStartupFolder) {
+    try {
+        $action = if ($arguments) {
+            New-ScheduledTaskAction -Execute $target -Argument $arguments -WorkingDirectory $dir
+        } else {
+            New-ScheduledTaskAction -Execute $target -WorkingDirectory $dir
+        }
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+        $trigger.Delay = 'PT10S'      # let the shell draw a taskbar to sit on
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries -StartWhenAvailable `
+            -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
+            -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+            -MultipleInstances IgnoreNew
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+            -Settings $settings -Description 'Claude usage on the taskbar' -Force | Out-Null
+        # One mechanism only: the app refuses to run twice anyway, but a stale
+        # shortcut would keep starting the old location after a move.
+        if (Test-Path $lnk) { Remove-Item $lnk -Force }
+        Write-Host "Starts at sign-in (scheduled task '$taskName')"
+        $installed = $true
+    } catch {
+        Write-Warning "Could not register the scheduled task ($($_.Exception.Message.Trim()))."
+        Write-Warning 'Falling back to the Startup folder, which can start a couple of minutes late.'
+    }
+}
+if (-not $installed) { Install-Shortcut }
 
 Stop-App
 if (-not $NoStart) {

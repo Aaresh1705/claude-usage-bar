@@ -495,6 +495,13 @@ def render_strip(W, H, primary, secondary, cfg):
     style = ic.get("style", "bar_text")
     skull_at = ic.get("skull_at", 100)
     use_skull = skull_at is not None and pct >= float(skull_at) - 0.5
+    skull_col = ic.get("skull_color", "auto")
+    auto_skull = skull_col == "auto"
+    skull_col = hex_to_rgba(theme_ink() if auto_skull else skull_col)
+    # The drop shadow is there to lift pale glyphs off the taskbar; under a
+    # near-black skull on a light taskbar it only smudges the outline.
+    skull_shadow = ic.get("text_shadow", True) and not (
+        auto_skull and windows_uses_light_theme())
     shown = round(pct) if pct < 99.5 else 99
     try:
         label = str(ic.get("label_format", "{pct}")).format(
@@ -505,7 +512,7 @@ def render_strip(W, H, primary, secondary, cfg):
     def glyph(box, font, color):
         """The number, or the skull once the limit is spent."""
         if use_skull:
-            draw_skull(img, box, color, ic.get("text_shadow", True))
+            draw_skull(img, box, skull_col, skull_shadow)
         else:
             draw_text_centered(d, box, label, font, color, ic.get("text_shadow", True))
 
@@ -1695,6 +1702,16 @@ def windows_uses_light_theme():
         return False
 
 
+def theme_ink(light=None):
+    """Ink for glyphs that have to read against the taskbar itself rather than
+    against a fill of ours. Near-black on light, near-white on dark - the flat
+    extremes look like a hole punched in the bar, so both are pulled back a
+    step, the same pair the widget uses for its text."""
+    if light is None:
+        light = windows_uses_light_theme()
+    return "#1A1A1A" if light else "#F2F2F2"
+
+
 def fade_image(image, factor):
     """Scale an image's alpha - used to dim numbers that are no longer live.
 
@@ -2071,7 +2088,7 @@ class TaskbarWidget(object):
         num_font = font(H * 0.62)
         if spent:
             skull_w = H * 0.52
-            draw_skull(img, (0, H * 0.18, skull_w, H * 0.82), hex_to_rgba(color), False)
+            draw_skull(img, (0, H * 0.18, skull_w, H * 0.82), hex_to_rgba(fg), False)
             text_end = skull_w
         else:
             label = "%d%%" % round(pct)
