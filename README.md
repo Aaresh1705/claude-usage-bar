@@ -401,6 +401,7 @@ success / caution / critical colours.
 | `install.ps1` | Install, update (`-Update`), uninstall (`-Uninstall`). Registers the logon task; `-UseStartupFolder` for the old shortcut. |
 | `build.ps1` | Builds the standalone `dist\ClaudeUsageBar.exe`. |
 | `make_icon.py` | Draws `assets\ClaudeUsageBar.ico` for the exe and the shortcut. |
+| `make_preview.py` | Redraws `preview.png` by calling the widget's own renderer, so the README picture cannot drift from the app. |
 | `preview.png` | The widget at 14%, 72%, 96%, 100% and rate-limited, light and dark. |
 | `assets/` | The app icon. |
 | `.icons/` | Generated `.ico` files (throwaway). |
