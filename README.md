@@ -57,19 +57,60 @@ widgets-board provider, but that one can only ever appear inside the Win+W panel
 
 ## Install
 
+Two ways, same app. A clone updates with one command; the exe needs nothing
+installed on the machine.
+
+Either way the machine has to be signed in to Claude Code (run `claude` once),
+because the usage figures come from the OAuth token in
+`~/.claude/.credentials.json`. And the taskbar's left corner has to be free:
+turn the Widgets button off in **Settings → Personalization → Taskbar**.
+
+### From a clone (recommended)
+
+Needs Python 3 (`winget install Python.Python.3.12` if it is missing).
+
 ```powershell
+git clone <your-repo-url> claude-usage-bar
+cd claude-usage-bar
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-Installs `pillow`/`requests` if missing, creates a Startup shortcut (runs hidden
-under `pythonw.exe`, no console window), and starts it immediately.
+That installs `pillow`/`requests` if they are missing, writes a `config.json`
+with the defaults, creates a Startup shortcut that runs it hidden under
+`pythonw.exe`, and starts it.
 
-Remove with `install.ps1 -Uninstall` (kills the process, deletes the shortcut,
-keeps `config.json`).
+To update later:
 
-If the icon lands in the tray overflow (the `^` chevron), drag it out once — Windows
-remembers the position, or set it permanently in
-Settings → Personalization → Taskbar → Other system tray icons.
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1 -Update
+```
+
+which pulls and restarts. Your `config.json` is not tracked, so it survives
+updates untouched.
+
+### From the exe
+
+`build.ps1` produces `dist\ClaudeUsageBar.exe` (~19 MB, Python and all the
+libraries inside it). Copy that one file to another PC, put it in a folder of
+its own, and run it. `install.ps1` next to the exe will make it start with
+Windows.
+
+The exe keeps `config.json`, the log and the cache beside itself. If you put it
+somewhere read-only, it uses `%LOCALAPPDATA%\claude-usage-bar` instead.
+
+**Corporate PCs:** a self-built exe is unsigned, and a machine with Windows
+Defender Application Control enforced will refuse to run it with "Access is
+denied" no matter where you put it (check with
+`(Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard).CodeIntegrityPolicyEnforcementStatus`
+— `2` means enforced). Use the clone route there: Python is signed, so it runs.
+
+### Removing it
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall
+```
+
+Stops it and deletes the Startup shortcut. `config.json` and the log stay.
 
 ## Configuration
 
@@ -341,8 +382,10 @@ success / caution / critical colours.
 | File | |
 | --- | --- |
 | `claude_usage_bar.pyw` | The whole app. |
-| `config.json` | Your settings, hot-reloaded. |
-| `install.ps1` | Install / uninstall. |
-| `preview.png` | Style sheet rendered at 16px and 24px. |
-| `preview_cells.png` | Segmented-gauge preview. |
+| `config.json` | Your settings, hot-reloaded. Not tracked by git: it is written from the defaults on first run, so it survives updates. |
+| `install.ps1` | Install, update (`-Update`), uninstall (`-Uninstall`). |
+| `build.ps1` | Builds the standalone `dist\ClaudeUsageBar.exe`. |
+| `make_icon.py` | Draws `assets\ClaudeUsageBar.ico` for the exe and the shortcut. |
+| `preview.png` | The widget at 14%, 72%, 96%, 100% and rate-limited, light and dark. |
+| `assets/` | The app icon. |
 | `.icons/` | Generated `.ico` files (throwaway). |

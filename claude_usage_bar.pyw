@@ -21,13 +21,41 @@ import webbrowser
 import winreg
 from datetime import datetime, timezone
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(APP_DIR, "config.json")
-LOG_PATH = os.path.join(APP_DIR, "claude_usage_bar.log")
+# Frozen into an .exe, __file__ points inside PyInstaller's temporary unpack
+# directory; the folder the user actually put the app in is the executable's.
+if getattr(sys, "frozen", False):
+    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _writable(path):
+    probe = os.path.join(path, ".write-probe")
+    try:
+        with open(probe, "w"):
+            pass
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+
+# Settings, log and cache live beside the app - which is what you want for a
+# clone or an exe in a folder of your own. Somewhere read-only (Program Files,
+# a network share) they fall back to the usual per-user location instead.
+DATA_DIR = APP_DIR if _writable(APP_DIR) else os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP", "."), "claude-usage-bar")
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception:
+    DATA_DIR = APP_DIR
+
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+LOG_PATH = os.path.join(DATA_DIR, "claude_usage_bar.log")
 FALLBACK_LOG = os.path.join(os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP", "."),
                             "claude-usage-bar", "claude_usage_bar.log")
-ICON_CACHE = os.path.join(APP_DIR, ".icons")
-USAGE_CACHE = os.path.join(APP_DIR, ".usage_cache.json")
+ICON_CACHE = os.path.join(DATA_DIR, ".icons")
+USAGE_CACHE = os.path.join(DATA_DIR, ".usage_cache.json")
 CRED_PATH = os.path.expanduser(os.path.join("~", ".claude", ".credentials.json"))
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 FONT_DIR = os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts")
@@ -76,9 +104,9 @@ DEFAULT_CONFIG = {
         "corner_offset": [12, 12],
         "close_on_focus_loss": True,
     },
-    "tray": {"enabled": True},
+    "tray": {"enabled": False},
     "taskbar_widget": {
-        "enabled": False,
+        "enabled": True,
         "metric": None,
         "corner": "left",
         "width": 128,

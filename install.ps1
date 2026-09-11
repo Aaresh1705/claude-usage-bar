@@ -1,72 +1,105 @@
-# Installs Claude Usage Bar: creates a Startup shortcut and launches it now.
-# Usage:  powershell -ExecutionPolicy Bypass -File install.ps1        (install)
-#         powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall
+# Installs Claude Usage Bar: starts it now and every time you sign in.
+#
+#   powershell -ExecutionPolicy Bypass -File install.ps1              install + start
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -Update      git pull, then restart
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall   stop + remove (keeps config.json)
+#
+# It works either way round: next to ClaudeUsageBar.exe it uses the exe, and in
+# a clone of the repository it runs the Python source with pythonw.
 
-param([switch]$Uninstall)
+param([switch]$Uninstall, [switch]$Update, [switch]$NoStart)
 
 $ErrorActionPreference = 'Stop'
-$dir    = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script = Join-Path $dir 'claude_usage_bar.pyw'
-$lnk    = Join-Path ([Environment]::GetFolderPath('Startup')) 'Claude Usage Bar.lnk'
+$dir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Claude Usage Bar.lnk'
+$source = Join-Path $dir 'claude_usage_bar.pyw'
+$icon = Join-Path $dir 'assets\ClaudeUsageBar.ico'
+
+$exe = @((Join-Path $dir 'ClaudeUsageBar.exe'), (Join-Path $dir 'dist\ClaudeUsageBar.exe')) |
+       Where-Object { Test-Path $_ } | Select-Object -First 1
+
+function Stop-App {
+    Get-CimInstance Win32_Process -Filter "Name='ClaudeUsageBar.exe'" -ErrorAction SilentlyContinue |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*claude_usage_bar*' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Milliseconds 400
+}
 
 if ($Uninstall) {
-    Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
-        Where-Object { $_.CommandLine -like '*claude_usage_bar.pyw*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+    Stop-App
     if (Test-Path $lnk) { Remove-Item $lnk -Force }
-    Write-Host 'Claude Usage Bar removed (config.json kept).'
+    Write-Host 'Claude Usage Bar removed. config.json and your log were left alone.'
     return
 }
 
-# Locate pythonw.exe
-$pyw = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source
-if (-not $pyw) {
-    $py = (Get-Command python.exe -ErrorAction SilentlyContinue).Source
-    if ($py) { $pyw = Join-Path (Split-Path -Parent $py) 'pythonw.exe' }
-}
-if (-not $pyw -or -not (Test-Path $pyw)) { throw 'pythonw.exe not found on PATH.' }
-
-# Dependencies
-& $pyw -c "import PIL, requests" 2>$null
-if ($LASTEXITCODE -ne 0) {
-    Write-Host 'Installing dependencies (pillow, requests)...'
-    & (Join-Path (Split-Path -Parent $pyw) 'python.exe') -m pip install --quiet pillow requests
-}
-
-# Startup shortcut
-$s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
-$s.TargetPath        = $pyw
-$s.Arguments         = '"' + $script + '"'
-$s.WorkingDirectory  = $dir
-$s.WindowStyle       = 7
-$s.Description       = 'Claude usage bar'
-$s.Save()
-Write-Host "Startup shortcut created: $lnk"
-
-# Restart any running instance
-Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
-    Where-Object { $_.CommandLine -like '*claude_usage_bar.pyw*' } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-Start-Sleep -Milliseconds 400
-Start-Process -FilePath $pyw -ArgumentList ('"' + $script + '"') -WorkingDirectory $dir -WindowStyle Hidden
-# Promote our tray icons out of the overflow. New tray icons default to hidden in
-# Windows 11, and each segment is a separate icon, so they all need promoting once.
-Start-Sleep -Seconds 3
-$promoted = 0
-Get-ChildItem 'HKCU:\Control Panel\NotifyIconSettings' -ErrorAction SilentlyContinue | ForEach-Object {
-    $v = Get-ItemProperty $_.PSPath
-    if ($v.ExecutablePath -eq $pyw) {
-        New-ItemProperty -Path $_.PSPath -Name 'IsPromoted' -Value 1 -PropertyType DWord -Force | Out-Null
-        $promoted++
+if ($Update) {
+    if (-not (Test-Path (Join-Path $dir '.git'))) {
+        throw 'This is not a clone of the repository, so there is nothing to pull. Download the latest exe instead.'
     }
-}
-if ($promoted) {
-    Write-Host "Promoted $promoted tray entries out of the overflow; restarting to apply..."
-    Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
-        Where-Object { $_.CommandLine -like '*claude_usage_bar.pyw*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-    Start-Sleep -Milliseconds 500
-    Start-Process -FilePath $pyw -ArgumentList ('"' + $script + '"') -WorkingDirectory $dir -WindowStyle Hidden
+    Write-Host 'Pulling the latest version...'
+    git -C $dir pull --ff-only
+    if ($LASTEXITCODE -ne 0) { throw 'git pull failed - resolve it by hand, then run this again.' }
 }
 
-Write-Host 'Running. Look for the usage pill in the tray (drag it out of the overflow if hidden).'
+# --- how are we going to run it? ---------------------------------------------
+if ($exe) {
+    $target = $exe
+    $arguments = ''
+    Write-Host "Using $exe"
+} else {
+    if (-not (Test-Path $source)) { throw "Neither ClaudeUsageBar.exe nor claude_usage_bar.pyw is in $dir." }
+
+    $pythonw = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source
+    if (-not $pythonw) {
+        $python = (Get-Command python.exe -ErrorAction SilentlyContinue).Source
+        if ($python) { $pythonw = Join-Path (Split-Path -Parent $python) 'pythonw.exe' }
+    }
+    if (-not $pythonw -or -not (Test-Path $pythonw)) {
+        throw @'
+Python 3 was not found. Either install it:
+    winget install Python.Python.3.12
+or use the prebuilt ClaudeUsageBar.exe, which needs no Python.
+'@
+    }
+
+    Write-Host 'Checking dependencies (pillow, requests)...'
+    & $pythonw -c "import PIL, requests" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        & (Join-Path (Split-Path -Parent $pythonw) 'python.exe') -m pip install --quiet --disable-pip-version-check pillow requests
+        if ($LASTEXITCODE -ne 0) { throw 'Could not install pillow/requests.' }
+    }
+    if (-not (Test-Path $icon)) {
+        & (Join-Path (Split-Path -Parent $pythonw) 'python.exe') (Join-Path $dir 'make_icon.py') | Out-Null
+    }
+
+    $target = $pythonw
+    $arguments = '"' + $source + '"'
+    Write-Host "Using $pythonw"
+}
+
+# --- start with Windows -------------------------------------------------------
+$shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+$shortcut.TargetPath = $target
+$shortcut.Arguments = $arguments
+$shortcut.WorkingDirectory = $dir
+$shortcut.WindowStyle = 7
+$shortcut.Description = 'Claude usage on the taskbar'
+if (Test-Path $icon) { $shortcut.IconLocation = $icon }
+$shortcut.Save()
+Write-Host "Starts with Windows: $lnk"
+
+Stop-App
+if (-not $NoStart) {
+    if ($arguments) {
+        Start-Process -FilePath $target -ArgumentList $arguments -WorkingDirectory $dir -WindowStyle Hidden
+    } else {
+        Start-Process -FilePath $target -WorkingDirectory $dir -WindowStyle Hidden
+    }
+    Write-Host 'Running. Look at the left end of your taskbar.'
+    Write-Host ''
+    Write-Host 'If the corner is occupied, turn the Widgets button off:'
+    Write-Host '  Settings > Personalization > Taskbar > Widgets'
+    Write-Host 'You also need to be signed in to Claude Code on this PC (run: claude).'
+}
