@@ -70,7 +70,7 @@ turn the Widgets button off in **Settings → Personalization → Taskbar**.
 Needs Python 3 (`winget install Python.Python.3.12` if it is missing).
 
 ```powershell
-git clone <your-repo-url> claude-usage-bar
+git clone https://github.com/Aaresh1705/claude-usage-bar.git
 cd claude-usage-bar
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
