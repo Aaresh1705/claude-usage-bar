@@ -11,6 +11,7 @@ import ctypes
 import ctypes.wintypes as wt
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -19,7 +20,7 @@ import traceback
 import uuid
 import webbrowser
 import winreg
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # Frozen into an .exe, __file__ points inside PyInstaller's temporary unpack
 # directory; the folder the user actually put the app in is the executable's.
@@ -56,6 +57,7 @@ FALLBACK_LOG = os.path.join(os.environ.get("LOCALAPPDATA") or os.environ.get("TE
                             "claude-usage-bar", "claude_usage_bar.log")
 ICON_CACHE = os.path.join(DATA_DIR, ".icons")
 USAGE_CACHE = os.path.join(DATA_DIR, ".usage_cache.json")
+NOTIFY_STATE = os.path.join(DATA_DIR, ".notify_state.json")
 CRED_PATH = os.path.expanduser(os.path.join("~", ".claude", ".credentials.json"))
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 FONT_DIR = os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts")
@@ -96,7 +98,12 @@ DEFAULT_CONFIG = {
         {"at": 85, "color": "#EF4444"},
     ],
     "tooltip_template": "Claude \u00b7 {primary_label}: {primary}%\n{secondary_label}: {secondary}%\nResets {primary_reset_short} (in {primary_reset_in})",
-    "notifications": {"enabled": True, "at": [80, 95], "metric": "session"},
+    "notifications": {"enabled": True, "at": [80, 95, 100],
+                      "metrics": ["session", "weekly_all", "weekly_scoped"]},
+    # Ask the usage endpoint for promotional grants once an hour. The endpoint
+    # only answers Claude Code, so that one request uses Claude Code's user
+    # agent; set this to false to never do that.
+    "check_events": True,
     "flyout": {
         "width": 320,
         "theme": "auto",
@@ -187,7 +194,13 @@ def load_config():
     try:
         if os.path.exists(CONFIG_PATH):
             with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
-                cfg = deep_merge(DEFAULT_CONFIG, json.load(fh))
+                user = json.load(fh)
+            cfg = deep_merge(DEFAULT_CONFIG, user)
+            # The old single "metric" still means what it says: otherwise the
+            # default "metrics" list is merged in and quietly wins over it.
+            n = user.get("notifications") if isinstance(user, dict) else None
+            if isinstance(n, dict) and "metric" in n and "metrics" not in n:
+                cfg["notifications"] = dict(cfg["notifications"], metrics=[n["metric"]])
         else:
             with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
                 json.dump(DEFAULT_CONFIG, fh, indent=2)
@@ -236,6 +249,7 @@ LABELS = {
 class Usage(object):
     status = None
     stale = False
+    with_events = False
 
     def age_seconds(self):
         """How old the numbers are, or None when there are none."""
@@ -250,6 +264,10 @@ class Usage(object):
         self.error = None
         self.updated = None
         self.raw = None
+        self.breakdown = []     # where this week's usage went, by product
+        self.buckets = []       # every other usage pool the endpoint reports
+        self.events = None      # live grants; None = not checked yet
+        self.events_checked = 0.0
 
     def by_key(self, key):
         if key == "max" and self.limits:
@@ -274,17 +292,23 @@ def read_token():
     raise RuntimeError("no accessToken in credentials file")
 
 
-def fetch_usage():
+def fetch_usage(with_events=False):
+    """One poll. With `with_events`, the same request also asks for promotional
+    grants - which the endpoint only reports to Claude Code, so that request
+    identifies as the Claude Code installed here. It returns every usual field
+    as well (only `spend` is skipped), so the event check costs no extra call."""
     u = Usage()
+    u.with_events = with_events
     try:
         token = read_token()
         resp = requests.get(
             USAGE_URL,
+            params={"cedar_ember": "1", "skip_spend": "1"} if with_events else None,
             headers={
                 "Authorization": "Bearer " + token,
                 "anthropic-beta": "oauth-2025-04-20",
                 "Content-Type": "application/json",
-                "User-Agent": "claude-usage-bar/1.0",
+                "User-Agent": claude_code_user_agent() if with_events else "claude-usage-bar/1.0",
             },
             timeout=20,
         )
@@ -315,6 +339,7 @@ def fetch_usage():
                 "resets_at": item.get("resets_at"),
                 "severity": item.get("severity") or "normal",
                 "group": item.get("group") or kind,
+                "active": bool(item.get("is_active")),
             })
         if not u.limits:
             for key, src in (("session", "five_hour"), ("weekly_all", "seven_day")):
@@ -330,6 +355,16 @@ def fetch_usage():
                     })
         u.spend = data.get("spend")
         u.extra = data.get("extra_usage")
+        u.breakdown = breakdown_rows(data)
+        u.buckets = extra_buckets(data)
+        if with_events:
+            # Grants are a bonus on top of the usage numbers: if they cannot
+            # be read, the numbers still count and events stays None (unknown).
+            try:
+                u.events = parse_events(data)
+                u.events_checked = time.time()
+            except Exception:
+                log("events unreadable: %s" % traceback.format_exc())
         u.updated = datetime.now()
     except FileNotFoundError:
         u.error = "Not signed in to Claude Code"
@@ -345,6 +380,9 @@ def save_usage_cache(usage):
     try:
         with open(USAGE_CACHE, "w", encoding="utf-8") as fh:
             json.dump({"limits": usage.limits, "extra": usage.extra, "spend": usage.spend,
+                       "breakdown": usage.breakdown, "buckets": usage.buckets,
+                       "events": getattr(usage, "events", None),
+                       "events_checked": getattr(usage, "events_checked", 0),
                        "updated": usage.updated.isoformat() if usage.updated else None}, fh)
     except Exception:
         pass
@@ -359,6 +397,8 @@ def load_usage_cache():
             blob = json.load(fh)
         u.limits = blob.get("limits") or []
         u.extra, u.spend = blob.get("extra"), blob.get("spend")
+        u.breakdown, u.buckets = blob.get("breakdown") or [], blob.get("buckets") or []
+        u.events, u.events_checked = blob.get("events"), float(blob.get("events_checked") or 0)
         if blob.get("updated"):
             u.updated = datetime.fromisoformat(blob["updated"])
         if not u.limits:
@@ -370,6 +410,218 @@ def load_usage_cache():
         return u
     except Exception:
         return None
+
+
+# The endpoint reports several usage pools as top-level objects shaped like
+# {"utilization": .., "resets_at": .., "locked_reason": ..}. Most are
+# codenamed and null. five_hour and seven_day are the pools `limits` already
+# describes and extra_usage is the paid overage shown on its own; everything
+# else is surfaced as-is, because the names change.
+_LIMIT_BUCKETS = ("five_hour", "seven_day", "extra_usage")
+
+
+def extra_buckets(data):
+    out = []
+    for key, value in (data or {}).items():
+        if key in _LIMIT_BUCKETS or not isinstance(value, dict) or "utilization" not in value:
+            continue
+        promotional = "promo" in key.lower()
+        # seven_day_<model> pools repeat the model-scoped weekly limits that
+        # `limits` already lists by name.
+        if key.startswith("seven_day_") and not promotional:
+            continue
+        try:
+            pct = float(value.get("utilization") or 0)
+        except (TypeError, ValueError):
+            continue             # one odd pool must not cost the whole poll
+        out.append({
+            "key": key,
+            "label": key.replace("_", " ").capitalize(),
+            "percent": pct,
+            "resets_at": value.get("resets_at"),
+            "locked_reason": value.get("locked_reason"),
+            "promotional": promotional,
+        })
+    return out
+
+
+def breakdown_rows(data):
+    """Where this week's usage went, by product - only the fields shown, so
+    nothing else the endpoint puts in a row ends up in the cache."""
+    blob = (data or {}).get("seven_day_breakdown")
+    rows = blob.get("rows") if isinstance(blob, dict) else None
+    out = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            pct = float(row.get("percent") or 0)
+        except (TypeError, ValueError):
+            continue
+        key = str(row.get("key") or "")
+        out.append({"key": key, "display_name": str(row.get("display_name") or key or "?"),
+                    "percent": pct})
+    return out
+
+
+def window_key(resets_at):
+    """A stable name for one limit window.
+
+    The API reports the same reset instant with different microseconds on
+    every request ("...12:10:00.165535" then "...12:10:00.134418"), so the raw
+    string cannot identify a window - comparing it made every poll look like a
+    fresh window and re-announced the same threshold once a minute. Resets land
+    on whole minutes; rounding to the minute absorbs the jitter.
+    """
+    if not resets_at:
+        return ""
+    moment = parse_reset(resets_at)
+    if moment is None:
+        return str(resets_at).split(".")[0]
+    moment = moment.astimezone(timezone.utc) + timedelta(seconds=30)
+    return moment.strftime("%Y-%m-%dT%H:%M")
+
+
+def limit_identity(lim):
+    """A stable name for one limit across polls. Several model-scoped weekly
+    limits share the kind "weekly_scoped", so the model is part of the name."""
+    if lim.get("key") == "weekly_scoped":
+        return "weekly_scoped:%s" % lim.get("label", "")
+    return lim.get("key") or "?"
+
+
+def watched_limits(usage, metrics):
+    """(identity, limit) for every limit the metric names select. "max" is
+    resolved to whichever limit is highest right now, but keeps that limit's
+    own identity - so the answer changing does not look like a new window."""
+    seen, out = set(), []
+    for metric in metrics:
+        if metric == "max":
+            chosen = [max(usage.limits, key=lambda l: l["percent"])] if usage.limits else []
+        else:
+            chosen = [l for l in usage.limits if l.get("key") == metric]
+        for lim in chosen:
+            identity = limit_identity(lim)
+            if identity not in seen:
+                seen.add(identity)
+                out.append((identity, lim))
+    return out
+
+
+def load_notify_state(path):
+    """What has already been announced, per limit: {key: [window, level]}.
+    Kept on disk so a restart does not announce it all over again."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        return {k: (v[0], v[1]) for k, v in raw.items() if isinstance(v, list) and len(v) == 2}
+    except Exception:
+        return {}
+
+
+def save_notify_state(path, state):
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({k: [v[0], v[1]] for k, v in state.items()}, fh)
+    except Exception:
+        pass
+
+
+EVENT_CHECK_SECONDS = 3600       # grants change rarely; the endpoint rate-limits hard
+USAGE_PAGE = "https://claude.ai/settings/usage"
+
+
+def claude_code_user_agent():
+    """The user agent of the installed Claude Code.
+
+    The usage endpoint only reports promotional grants to Claude Code itself:
+    asked by anything else it answers `"eligible": false, "ineligible_reason":
+    "surface"`. So the one request that looks for grants identifies as the
+    Claude Code on this machine - read from its install, not guessed.
+    """
+    version = None
+    shape = re.compile(r"^\d+(\.\d+)+$")
+    try:
+        root = os.path.expanduser(os.path.join("~", ".local", "share", "claude", "versions"))
+        names = [n for n in os.listdir(root) if shape.match(n)]
+        if names:
+            version = max(names, key=lambda n: tuple(int(x) for x in n.split(".")))
+    except Exception:
+        pass
+    if not version:
+        try:
+            with open(os.path.expanduser(os.path.join("~", ".claude.json")), encoding="utf-8") as fh:
+                seen = json.load(fh).get("lastReleaseNotesSeen")
+            if isinstance(seen, str) and shape.match(seen):
+                version = seen
+        except Exception:
+            pass
+    return "claude-cli/%s (external, cli)" % (version or "2.1.0")
+
+
+def _count(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_events(data):
+    """Grants that are live right now, from any program in the response.
+
+    A program is any top-level object carrying a `grants` list (today that is
+    `cedar_ember`, the limit-reset program). Reading them by shape rather than
+    by codename means the next promotion shows up without a code change.
+    """
+    now = datetime.now(timezone.utc)
+    events = []
+    for program, value in (data or {}).items():
+        if not isinstance(value, dict) or not isinstance(value.get("grants"), list):
+            continue
+        if value.get("eligible") is False:
+            continue
+        for grant in value["grants"]:
+            if not isinstance(grant, dict):
+                continue
+            left = _count(grant.get("resets_left"))
+            ends = parse_reset(grant.get("ends_at"))
+            if grant.get("paused") or (left is not None and left <= 0):
+                continue
+            if ends is not None and ends <= now:
+                continue
+            clears = grant.get("clears")
+            events.append({
+                "program": program,
+                "id": str(grant.get("id") or program),
+                "label": str(grant.get("label") or program.replace("_", " ").capitalize()),
+                "resets_left": left,
+                "resets_total": _count(grant.get("resets_total")),
+                "ends_at": grant.get("ends_at") if ends is not None else None,
+                "clears": [str(c) for c in clears] if isinstance(clears, list) else [],
+                "usable_now": grant.get("usable_now") is not False,
+            })
+    return events
+
+
+def live_events(usage):
+    """The cached grants that have not expired. The cache can outlive a grant
+    when polls keep failing, so expiry is checked again at display time."""
+    now = datetime.now(timezone.utc)
+    out = []
+    for event in (getattr(usage, "events", None) or []):
+        ends = parse_reset(event.get("ends_at"))
+        if ends is None or ends > now:
+            out.append(event)
+    return out
+
+
+def describe_clears(clears):
+    """What a limit reset puts back to full, in words."""
+    names = {"five_hour": "5-hour", "seven_day": "weekly"}
+    parts = [names[c] for c in clears if c in names]
+    if not parts:
+        return ""
+    return " and ".join(parts) + (" limit" if len(parts) == 1 else " limits")
 
 
 def parse_reset(value):
@@ -768,12 +1020,17 @@ class TrayApp(object):
         self.registered = 0
         self.use_guid = bool(self.cfg["icon"].get("use_guid", True))
         self.icon_slot = 0
-        self.last_notified = {}
+        self.state_path = NOTIFY_STATE
+        self.last_notified = load_notify_state(self.state_path)
+        self._signed_out_since = None
+        self.events_retry_at = 0.0       # a failed event check waits its turn
+        self._event_backoff = 0
         self.flyout = None
         self.widget = None
         self.toast = None
         self._fetching = False
         self._pending = None
+
         self.backoff = 0
         self.retry_at = 0
         self._lock = threading.Lock()
@@ -933,20 +1190,22 @@ class TrayApp(object):
 
     def notify(self, title, body):
         """Balloon through the tray when there is one, our own toast when there
-        isn't - the warnings must not depend on which surface is enabled."""
+        isn't - the warnings must not depend on which surface is enabled.
+        Returns False when nothing was shown, so the caller can try again."""
         if self.tray_enabled() and self.registered:
             nid = self._nid(NIF_INFO)
             nid.szInfoTitle = title[:63]
             nid.szInfo = body[:255]
             nid.dwInfoFlags = 0x01
             if shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid)):
-                return
+                return True
         try:
             if self.toast is None:
                 self.toast = Toast(self)
-            self.toast.show(title, body)
+            return self.toast.show(title, body)
         except Exception:
             log("toast failed: %s" % traceback.format_exc())
+            return False
 
     def remove_icon(self):
         for k in range(max(self.registered, self._segment_count(), 1)):
@@ -1026,29 +1285,58 @@ class TrayApp(object):
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     # -- data --------------------------------------------------------------
+    def events_enabled(self):
+        return bool(self.cfg.get("check_events", True))
+
+    def event_poll_due(self):
+        """One poll an hour doubles as the event check, so looking for grants
+        never costs a request of its own. A failed event check backs off on its
+        own clock, and the polls in between go out as plain usage requests - so
+        a problem with the event check can never freeze the numbers."""
+        if not self.events_enabled():
+            return False
+        now = time.time()
+        if now < self.events_retry_at:
+            return False
+        age = now - float(self.usage.events_checked or 0)
+        return self.usage.events is None or age >= EVENT_CHECK_SECONDS
+
+    def _event_check_failed(self, result):
+        self._event_backoff = min(max(self._event_backoff * 2, 300), EVENT_CHECK_SECONDS)
+        self.events_retry_at = time.time() + self._event_backoff
+        log("event check failed (%s); next in %ds"
+            % (result.error or "unreadable grants", self._event_backoff))
+
+    def _back_off(self):
+        self.backoff = min(max(self.backoff * 2, 120), 1800)
+        self.retry_at = time.time() + self.backoff
+        log("rate limited; next poll in %ds" % self.backoff)
+
     def note_rate_limit(self, result):
         """429 means the endpoint wants us to slow down; polling it every minute
         regardless just keeps it angry (and floods the log)."""
         if getattr(result, "status", None) == 429:
-            self.backoff = min(max(self.backoff * 2, 120), 1800)
-            self.retry_at = time.time() + self.backoff
-            log("rate limited; next poll in %ds" % self.backoff)
+            self._back_off()
         elif not result.error:
             self.backoff = 0
             self.retry_at = 0
 
-    def start_fetch(self, manual=False):
+    def start_fetch(self, manual=False, events=None):
         if self._fetching:
             return
         if not manual and self.retry_at and time.time() < self.retry_at:
             return
         self._fetching = True
+        if events is None:
+            # Refresh re-checks events too, so a reset you have just used
+            # stops being advertised straight away.
+            events = self.events_enabled() and (manual or self.event_poll_due())
 
         def worker():
-            result = fetch_usage()
-            with self._lock:
+            result = fetch_usage(events)
+            self._fetching = False          # before the result is visible, so
+            with self._lock:                # apply_pending can fetch again
                 self._pending = result
-            self._fetching = False
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1059,10 +1347,32 @@ class TrayApp(object):
             result, self._pending = self._pending, None
         if result is None:
             return
+        if result.with_events:
+            if result.error or result.events is None:
+                self._event_check_failed(result)
+                if result.status not in (None, 429):
+                    # Refused as the event check: that says nothing about
+                    # usage, so ask again the plain way rather than show - or
+                    # announce - an error that may be the event check's alone.
+                    self.start_fetch(manual=True, events=False)
+                    return
+            else:
+                self._event_backoff = 0
         if result.error and result.error != "Not signed in to Claude Code" and self.usage.limits:
             result.limits = self.usage.limits  # keep last good numbers on a blip
             result.spend, result.extra = self.usage.spend, self.usage.extra
+            result.breakdown, result.buckets = self.usage.breakdown, self.usage.buckets
             result.updated = self.usage.updated
+        fresh_events = result.with_events and not result.error and result.events is not None
+        if fresh_events:
+            if result.spend is None:          # the event poll skips `spend`
+                result.spend = self.usage.spend
+            before = [e["id"] for e in (self.usage.events or [])]
+            if [e["id"] for e in result.events] != before:
+                log("events: %s" % (", ".join(e["label"] for e in result.events) or "none"))
+        elif self.events_enabled():
+            result.events = self.usage.events
+            result.events_checked = self.usage.events_checked
         self.usage = result
         if not result.error:
             save_usage_cache(result)
@@ -1073,30 +1383,127 @@ class TrayApp(object):
             self.flyout.refresh(self.usage)
 
     def check_notifications(self):
-        """Balloon once per threshold per reset window - never twice for the
-        same level, and never again for a level already passed."""
+        """Announce each threshold once per limit window - never twice for the
+        same level, never again for a level already passed, and not again after
+        a restart. Every watched limit is checked on its own, so a weekly limit
+        running out is announced while the session is fine; alerts that fall
+        due on the same poll share one toast instead of replacing each other."""
         n = self.cfg.get("notifications") or {}
-        if not n.get("enabled") or self.usage.error:
+        if not n.get("enabled"):
             return
-        key = n.get("metric", "session")
-        lim = self.usage.by_key(key)
-        if not lim:
-            return
-        pct = lim["percent"]
-        reset = lim.get("resets_at") or ""
-        crossed = [float(t) for t in (n.get("at") or []) if pct >= float(t)]
+        before = dict(self.last_notified)
+        due = []
+        signed_out = self._check_signed_out(n)
+        if signed_out:
+            due.append(signed_out)
+        if not self.usage.error:
+            metrics = n.get("metrics") or [n.get("metric", "session")]
+            # Reaching a limit is always worth saying, whatever the list omits.
+            thresholds = sorted(set(float(t) for t in (n.get("at") or [])) | {100.0})
+            for identity, lim in watched_limits(self.usage, metrics):
+                alert = self._notify_limit(identity, lim, thresholds)
+                if alert:
+                    due.append(alert)
+        if n.get("events", True):
+            due.extend(self._grant_alerts())
+        if due:
+            if len(due) == 1:
+                title, body = due[0][2], due[0][3]
+            else:
+                title = "Claude usage"
+                body = "\n".join(alert[4] for alert in due)
+            # Only count it as announced if it was actually shown: a toast held
+            # back because you are in a game or a video is tried again next
+            # poll rather than silently dropped.
+            if self.notify(title, body) is not False:
+                for alert in due:
+                    self.last_notified[alert[0]] = alert[1]
+        if self.last_notified != before:
+            save_notify_state(self.state_path, self.last_notified)
+
+    def _check_signed_out(self, n):
+        """Numbers that silently stop updating are worse than a nudge. Once
+        sign-in has been failing for a quarter of an hour, say so - once per
+        outage. Only a successful poll ends an outage: going offline in the
+        middle of one does not start the count again."""
+        error = str(self.usage.error or "")
+        if not error:
+            self._signed_out_since = None
+            self.last_notified.pop("__signed_out__", None)
+            return None
+        missing = error == "Not signed in to Claude Code"
+        if not (missing or error.startswith("Signed out")):
+            return None
+        if self._signed_out_since is None:
+            self._signed_out_since = time.time()
+        if "__signed_out__" in self.last_notified:
+            return None
+        if time.time() - self._signed_out_since < float(n.get("signed_out_after", 900)):
+            return None
+        title = "Claude usage is not updating"
+        body = ("Claude Code is not signed in on this PC. Run claude and log in."
+                if missing else
+                "Claude Code's sign-in has expired. Run any claude command to refresh it.")
+        return "__signed_out__", ("", 1), title, body, title
+
+    def _grant_alerts(self):
+        """One alert per grant, ever, on the first poll that can show it - held
+        back while you are busy, it is simply due again next poll. A grant that
+        cannot be used yet waits until it can."""
+        out = []
+        for event in live_events(self.usage):
+            key = "grant:" + event["id"]
+            if key in self.last_notified or event.get("usable_now") is False:
+                continue
+            ends = parse_reset(event.get("ends_at"))
+            what = describe_clears(event.get("clears") or [])
+            left = event.get("resets_left")
+            title = ("Free limit reset available" if left == 1
+                     else "%s free limit resets available" % left if left else event["label"])
+            body = event["label"]
+            if what:
+                body += " - puts your %s back to full" % what
+            if ends is not None:
+                body += ". Use it before %s in Settings > Usage." % ends.strftime("%a %d %b %H:%M")
+            line = title if title == event["label"] else "%s: %s" % (title, event["label"])
+            out.append((key, (event.get("ends_at") or "", 1), title, body, line))
+        return out
+
+    def _notify_limit(self, key, lim, thresholds):
+        """Returns (key, record, title, body, line) when an alert is due."""
+        pct = float(lim["percent"])
+        window = window_key(lim.get("resets_at"))
+        crossed = [t for t in thresholds if pct >= t]
         level = max(crossed) if crossed else None
 
-        prev_reset, prev_level = self.last_notified.get(key, (None, None))
-        if reset != prev_reset:         # the window rolled over: start fresh
+        prev_window, prev_level = self.last_notified.get(key, (None, None))
+        if window != prev_window:       # a genuinely new window: start fresh
+            prev_level = None
+        elif prev_level is not None and pct < min(thresholds) / 2.0:
+            # Inside one window usage only falls that far when the limit was
+            # reset early - a redeemed limit reset. Running out again is news.
             prev_level = None
         if level is None or (prev_level is not None and level <= prev_level):
-            self.last_notified[key] = (reset, prev_level)
-            return
-        self.notify("Claude usage %d%%" % round(pct),
-                    "%s at %d%% - resets in %s"
-                    % (lim["label"], round(pct), human_delta(parse_reset(reset))))
-        self.last_notified[key] = (reset, level)
+            self.last_notified[key] = (window, prev_level)
+            return None
+
+        reset = parse_reset(lim.get("resets_at"))
+        when = ""
+        if reset is not None:
+            local = reset.astimezone()
+            fmt = "%H:%M" if (reset - datetime.now(timezone.utc)).total_seconds() < 86400 else "%a %H:%M"
+            when = "resets %s (in %s)" % (local.strftime(fmt), human_delta(reset))
+        if level >= 100:
+            title = "%s limit reached" % lim["label"]
+            # not .capitalize(): it lowercases the rest, turning "Sat" into "sat"
+            body = (when[:1].upper() + when[1:]) if when else "No reset time reported."
+        else:
+            title = "Claude usage %d%%" % round(pct)
+            body = "%s at %d%%%s" % (lim["label"], round(pct), (" - " + when) if when else "")
+        # and a one-line form, for when several alerts share a toast
+        line = ("%s - %s" % (title, when) if level >= 100 and when
+                else title if level >= 100 else body)
+        return key, (window, level), title, body, line
 
     def reload_config(self):
         self.cfg = load_config()
@@ -1330,6 +1737,67 @@ class Flyout(object):
         self._images.append(photo)
         return photo
 
+    def _event_card(self, event, colors, content):
+        """A live promotion: what it is, what it does, when it runs out, and
+        where to use it. Claiming it is left to you - it is a one-off."""
+        gold = self.app.cfg.get("taskbar_widget", {}).get("event_color", "#F59E0B")
+        card = tk.Frame(self.body, bg=colors["surface"])
+        card.pack(fill="x", pady=(self.px(12), 0))
+        head = tk.Frame(card, bg=colors["surface"])
+        head.pack(fill="x")
+        tk.Label(head, text="✦", bg=colors["surface"], fg=gold,
+                 font=self.font(14, "bold")).pack(side="left", anchor="n")
+        tk.Label(head, text=event["label"], bg=colors["surface"], fg=colors["text"],
+                 font=self.font(13, "bold"), anchor="w", justify="left",
+                 wraplength=content - self.px(22)).pack(side="left", fill="x", padx=(self.px(4), 0))
+
+        details = []
+        left, total = event.get("resets_left"), event.get("resets_total")
+        if left is not None:
+            details.append("%s of %s reset%s left" % (left, total or left, "" if (total or left) == 1 else "s"))
+        what = describe_clears(event.get("clears") or [])
+        if what:
+            details.append("Puts your %s back to full" % what)
+        ends = parse_reset(event.get("ends_at"))
+        if ends is not None:
+            details.append("Expires %s · in %s" % (ends.strftime("%a %d %b %H:%M"), human_delta(ends)))
+        if event.get("usable_now") is False:
+            details.append("Not usable yet")
+        for line in details:
+            tk.Label(card, text=line, bg=colors["surface"], fg=colors["muted"], font=self.font(12),
+                     anchor="w", justify="left").pack(fill="x", padx=(self.px(22), 0))
+        self._button(card, "Use it in Settings", lambda: webbrowser.open(USAGE_PAGE),
+                     colors).pack(anchor="w", padx=(self.px(22), 0), pady=(self.px(6), 0))
+
+    _SPLIT = ("#8B5CF6", "#06B6D4", "#F97316", "#EC4899", "#84CC16",
+              "#3B82F6", "#EAB308", "#14B8A6")
+
+    def _split_color(self, index, colors):
+        return self._SPLIT[index % len(self._SPLIT)]
+
+    def _split_bar(self, width, shares, colors):
+        """One rounded bar divided by each product's share of the week."""
+        h = self.px(8)
+        ss = 4
+        W, H = width * ss, h * ss
+        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle((0, 0, W - 1, H - 1), radius=H / 2.0, fill=hex_to_rgba(colors["track"]))
+        total = sum(pct for _, pct in shares) or 1.0
+        x = 0.0
+        paint = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        pd = ImageDraw.Draw(paint)
+        for i, (_, pct) in enumerate(shares):
+            span = (W - 1) * pct / max(total, 100.0)
+            pd.rectangle((x, 0, x + span, H - 1), fill=hex_to_rgba(self._split_color(i, colors)))
+            x += span
+        mask = Image.new("L", (W, H), 0)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, W - 1, H - 1), radius=H / 2.0, fill=255)
+        img.paste(paint, (0, 0), Image.composite(mask, Image.new("L", (W, H), 0), paint.split()[3]))
+        photo = ImageTk.PhotoImage(img.resize((width, h), Image.LANCZOS))
+        self._images.append(photo)
+        return photo
+
     def _button_images(self, text, colors, accent=False):
         """Rounded Fluent buttons, rendered twice for the hover state."""
         pad_x, height, radius = self.px(12), self.px(30), self.px(4)
@@ -1388,19 +1856,24 @@ class Flyout(object):
         button hover states and flashes the panel."""
         if not self.visible:
             return
-        key = (usage.error, usage.updated,
-               tuple((l["label"], round(l["percent"], 2), l["resets_at"]) for l in usage.limits))
-        if key == getattr(self, "_content_key", None):
+        if self.content_key(usage) == getattr(self, "_content_key", None):
             return
-        self._content_key = key
         self.render(usage)
         self.win.update_idletasks()
         self.win.geometry("%dx%d" % (self.win.winfo_reqwidth(), self.win.winfo_reqheight()))
 
+    @staticmethod
+    def content_key(usage):
+        """Everything the panel shows, so refresh() rebuilds only on a change."""
+        return (usage.error, usage.updated,
+                tuple((l["label"], round(l["percent"], 2), l["resets_at"]) for l in usage.limits),
+                tuple((b["key"], b["percent"]) for b in (usage.buckets or [])),
+                tuple((r.get("key"), r.get("percent")) for r in (usage.breakdown or [])),
+                tuple((e["id"], e.get("resets_left"), e.get("usable_now"))
+                      for e in live_events(usage)))
+
     def render(self, usage):
-        self._content_key = (usage.error, usage.updated,
-                             tuple((l["label"], round(l["percent"], 2), l["resets_at"])
-                                   for l in usage.limits))
+        self._content_key = self.content_key(usage)
         colors = self.theme()
         cfg = self.app.cfg["flyout"] or {}
         self._clear()
@@ -1435,6 +1908,9 @@ class Flyout(object):
             label(note, text, size=12, color=colors["caution"], anchor="w", fill="x")
 
         light = colors is FLUENT["light"]
+        for event in live_events(usage):
+            self._event_card(event, colors, content)
+
         for lim in usage.limits:
             pct = float(lim["percent"])
             color = self.severity_color(pct)
@@ -1454,6 +1930,63 @@ class Flyout(object):
                       "Resets %s · in %s" % (reset.strftime("%a %H:%M"), human_delta(reset)),
                       size=12, color=colors["muted"], anchor="w", fill="x",
                       pady=(self.px(4), 0))
+
+        # Where this week's usage went, as one stacked bar and a legend.
+        shares = [(r.get("display_name") or r.get("key") or "?", float(r.get("percent") or 0))
+                  for r in (usage.breakdown or [])]
+        shares = [(name, pct) for name, pct in shares if pct > 0]
+        if shares:
+            label(self.body, "This week by product", size=12, color=colors["muted"],
+                  anchor="w", fill="x", pady=(self.px(16), 0))
+            split = tk.Label(self.body, image=self._split_bar(content, shares, colors),
+                             bd=0, highlightthickness=0, bg=colors["surface"])
+            split.pack(fill="x", pady=(self.px(6), 0))
+            # Laid out in rows by measured width, so a long list wraps instead
+            # of widening the panel. No border or padding on these labels, so
+            # the font's measurement is their whole width.
+            import tkinter.font as tkfont
+            text_font, dot_font = tkfont.Font(font=self.font(12)), tkfont.Font(font=self.font(11))
+            gap = self.px(4) + self.px(12)
+            legend, used = None, 0
+            for i, (name, pct) in enumerate(shares):
+                text = "%s %d%%" % (name, round(pct))
+                need = dot_font.measure("\u25cf") + text_font.measure(text) + gap
+                if legend is None or used + need > content:
+                    legend = tk.Frame(self.body, bg=colors["surface"])
+                    legend.pack(fill="x", pady=(self.px(4 if used == 0 else 2), 0))
+                    used = 0
+                used += need
+                for text_, font_, fg_, padx_ in (
+                        ("\u25cf", self.font(11), self._split_color(i, colors), 0),
+                        (text, self.font(12), colors["muted"], (self.px(4), self.px(12)))):
+                    tk.Label(legend, text=text_, bg=colors["surface"], fg=fg_, font=font_,
+                             bd=0, padx=0, highlightthickness=0).pack(side="left", padx=padx_)
+
+        # Any other usage pool the endpoint reports - promotions and new
+        # products appear here before anyone gives them a proper name. An idle
+        # pool (0%, no window, not locked) is just a name the API happens to
+        # send, so it stays out of the way.
+        for pool in (usage.buckets or []):
+            if not (pool["percent"] > 0 or pool.get("resets_at") or pool.get("locked_reason")
+                    or pool.get("promotional")):
+                continue
+            row = tk.Frame(self.body, bg=colors["surface"])
+            row.pack(fill="x", pady=(self.px(12), 0))
+            label(row, pool["label"], size=13, side="left")
+            if pool.get("promotional"):
+                label(row, "  promotion", size=11, weight="bold",
+                      color=self.accent(), side="left")
+            label(row, "%d%%" % round(pool["percent"]), size=13, weight="bold",
+                  color=self.text_color_for(pool["percent"], light), side="right")
+            bits = []
+            reset = parse_reset(pool.get("resets_at"))
+            if reset:
+                bits.append("Resets %s · in %s" % (reset.strftime("%a %H:%M"), human_delta(reset)))
+            if pool.get("locked_reason"):
+                bits.append("Locked: %s" % pool["locked_reason"])
+            if bits:
+                label(self.body, "   ".join(bits), size=12, color=colors["muted"],
+                      anchor="w", fill="x", pady=(self.px(4), 0))
 
         extra = usage.extra or {}
         if extra.get("is_enabled"):
@@ -1710,6 +2243,21 @@ def theme_ink(light=None):
     if light is None:
         light = windows_uses_light_theme()
     return "#1A1A1A" if light else "#F2F2F2"
+
+
+def draw_sparkle(img, w, h, color):
+    """A small four-point star in the widget's top-right corner: something
+    special is on, open the flyout. Drawn at 4x and scaled down, like the rest."""
+    size = max(7, int(h * 0.30))
+    ss = 4
+    S = size * ss
+    star = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(star)
+    c, t = S / 2.0, S * 0.13
+    d.polygon([(c, 0), (c + t, c - t), (S, c), (c + t, c + t),
+               (c, S), (c - t, c + t), (0, c), (c - t, c - t)], fill=color)
+    star = star.resize((size, size), Image.LANCZOS)
+    img.alpha_composite(star, (max(0, w - size - 1), 1))
 
 
 def fade_image(image, factor):
@@ -2045,12 +2593,15 @@ class TaskbarWidget(object):
         # worth showing at full strength. The flyout explains the error.
         age = usage.age_seconds()
         stale = age is None or age > max(300.0, 3.0 * float(self.app.cfg["refresh_seconds"]))
-        state = (round(pct, 1), human_delta(reset), error, stale, self.geometry,
+        event = bool(live_events(usage)) and bool(c.get("show_events", True))
+        state = (round(pct, 1), human_delta(reset), error, stale, event, self.geometry,
                  windows_uses_light_theme())
         if state == self._last_key:
             return
         _, _, w, h = self.geometry
         image = self._render(w, h, pct, reset, error)
+        if event:
+            draw_sparkle(image, w, h, hex_to_rgba(c.get("event_color", "#F59E0B")))
         if stale:
             image = fade_image(image, float(c.get("stale_opacity", 0.55)))
         self._image = image
@@ -2163,8 +2714,9 @@ class Toast(object):
         return max(1, int(round(logical * self.scale)))
 
     def show(self, title, message, seconds=8):
+        """Returns False when held back, so the caller can retry later."""
         if user_is_busy():
-            return                      # don't paint over a game or a call
+            return False                # don't paint over a game or a call
         colors = FLUENT["light" if windows_uses_light_theme() else "dark"]
         family = "Segoe UI Variable Text"
         self.scale = ui_scale()
@@ -2211,6 +2763,7 @@ class Toast(object):
             except Exception:
                 pass
         self._after = root.after(int(seconds * 1000), self.hide)
+        return True
 
     def _clicked(self):
         self.hide()

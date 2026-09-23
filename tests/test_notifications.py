@@ -1,0 +1,581 @@
+"""Notification and event behaviour, driven through the real TrayApp methods.
+
+Run:  python tests/test_notifications.py
+
+The reset timestamps here are shaped like the real API's: the same reset
+instant comes back with different microseconds on every request, e.g.
+"2026-09-23T12:10:00.165535+00:00" then "2026-09-23T12:10:00.134418+00:00".
+"""
+
+import copy
+import importlib.util
+import itertools
+import json
+import os
+import sys
+import tempfile
+import threading
+import time
+from datetime import datetime
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+APP = os.path.join(os.path.dirname(HERE), "claude_usage_bar.pyw")
+
+
+def load_app():
+    spec = importlib.util.spec_from_file_location("claude_usage_bar_under_test", APP)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not module.import_dependencies():
+        raise SystemExit("Pillow / requests are missing")
+    return module
+
+
+app = load_app()
+
+# Everything the app would write - its log, the usage cache, the notification
+# state, the config - goes to a scratch directory. Without this the tests wrote
+# into the real app's files, and the running widget picked up a made-up event.
+_SANDBOX = tempfile.mkdtemp(prefix="claude-usage-bar-tests-")
+for _name in ("LOG_PATH", "FALLBACK_LOG", "USAGE_CACHE", "NOTIFY_STATE", "CONFIG_PATH"):
+    setattr(app, _name, os.path.join(_SANDBOX, os.path.basename(getattr(app, _name))))
+
+_micro = itertools.count(100000, 7919)
+
+
+def stamp(base):
+    """`base` with fresh microseconds, like every API response."""
+    return "%s.%06d+00:00" % (base, next(_micro) % 1000000)
+
+
+class Harness(object):
+    """TrayApp's notification methods with nothing else attached."""
+
+    check_notifications = app.TrayApp.check_notifications
+    _notify_limit = app.TrayApp._notify_limit
+    _check_signed_out = app.TrayApp._check_signed_out
+    _grant_alerts = app.TrayApp._grant_alerts
+    events_enabled = app.TrayApp.events_enabled
+
+    def __init__(self, state_dir=None, metrics=("session",), at=(80, 95, 100), busy=False):
+        self.cfg = {"notifications": {"enabled": True, "at": list(at), "metrics": list(metrics)},
+                    "refresh_seconds": 60}
+        self.usage = app.Usage()
+        self.sent = []
+        self.busy = busy
+        self.state_path = os.path.join(state_dir or tempfile.mkdtemp(), ".notify_state.json")
+        self.last_notified = app.load_notify_state(self.state_path)
+        self._signed_out_since = None
+        self.events_retry_at = 0.0
+        self._event_backoff = 0
+
+    def notify(self, title, body):
+        if self.busy:
+            return False
+        self.sent.append((title, body))
+        return True
+
+    def set(self, **limits):
+        """set(session=(pct, reset_base[, label]), ...)"""
+        self.usage.error = None
+        self.usage.limits = []
+        for key, spec in limits.items():
+            pct, base = spec[0], spec[1]
+            label = spec[2] if len(spec) > 2 else key
+            kind = key.split("__")[0]
+            self.usage.limits.append({"key": kind, "label": label, "percent": float(pct),
+                                      "resets_at": stamp(base) if base else None,
+                                      "severity": "normal", "group": kind})
+
+    def poll(self, **limits):
+        self.set(**limits)
+        self.check_notifications()
+        return len(self.sent)
+
+    def fail(self, error):
+        self.usage.error = error
+        self.check_notifications()
+
+
+FAILURES = []
+
+
+def check(name, condition, detail=""):
+    print("  %s  %s%s" % ("PASS" if condition else "FAIL", name, ("  - " + detail) if detail else ""))
+    if not condition:
+        FAILURES.append(name)
+
+
+def titles(h):
+    return [t for t, _ in h.sent]
+
+
+S1 = "2026-09-23T12:10:00"      # a session window
+S2 = "2026-09-23T17:10:00"      # the next one
+W1 = "2026-09-26T07:00:00"      # a weekly window
+SIGNED_OUT = "Signed out - run any Claude Code command"
+
+
+def test_spam():
+    print("sitting at 100% for an hour of polls, reset string jittering every time")
+    h = Harness()
+    for _ in range(60):
+        h.poll(session=(100, S1))
+    check("exactly one notification, not one per poll", len(h.sent) == 1, "%d sent" % len(h.sent))
+
+    print("climbing 50 -> 80 -> 95 -> 100 inside one window")
+    h = Harness()
+    for pct in (50, 70, 80, 81, 90, 95, 97, 100, 100, 100):
+        h.poll(session=(pct, S1))
+    check("one per threshold: 80, 95, 100", len(h.sent) == 3, repr(titles(h)))
+    check("the 100% one says the limit is reached",
+          bool(h.sent) and "reached" in h.sent[-1][0].lower(), repr(h.sent[-1:]))
+
+    print("jumping from 70% straight to 100% between polls")
+    h = Harness()
+    for pct in (70, 100, 100):
+        h.poll(session=(pct, S1))
+    check("one notification for the jump, not three", len(h.sent) == 1, repr(titles(h)))
+
+    print("the window genuinely rolls over while usage stays high")
+    h = Harness()
+    for _ in range(5):
+        h.poll(session=(100, S1))
+    for _ in range(5):
+        h.poll(session=(96, S2))
+    check("one per window: two in total", len(h.sent) == 2, repr(titles(h)))
+
+    print("dipping below a threshold and coming back in the same window")
+    h = Harness()
+    for pct in (85, 79, 85, 79, 85):
+        h.poll(session=(pct, S1))
+    check("80% announced once", len(h.sent) == 1, repr(titles(h)))
+
+    print("errors and rate limiting flapping in between")
+    h = Harness()
+    for i in range(20):
+        if i % 2:
+            h.fail("Rate limited by the usage API")
+        else:
+            h.poll(session=(100, S1))
+    check("still one notification", len(h.sent) == 1, "%d sent" % len(h.sent))
+
+    print("the app restarts while you are at 100%")
+    state = tempfile.mkdtemp()
+    Harness(state).poll(session=(100, S1))
+    h2 = Harness(state)                      # a new process, same state file
+    for _ in range(10):
+        h2.poll(session=(100, S1))
+    check("no repeat after a restart", len(h2.sent) == 0, "%d sent after restart" % len(h2.sent))
+
+    print("using a limit reset: 100%, back to 3% in the same window, then out again")
+    h = Harness()
+    for pct in (100, 100, 3, 10, 50, 81, 100, 100):
+        h.poll(session=(pct, S1))
+    check("reached, then 80% and reached again after the reset",
+          titles(h) == ["session limit reached", "Claude usage 81%", "session limit reached"],
+          repr(titles(h)))
+
+
+def test_coverage():
+    print("the weekly limit runs out while the session is fine")
+    h = Harness(metrics=("session", "weekly_all"))
+    for _ in range(10):
+        h.poll(session=(30, S1), weekly_all=(100, W1, "Weekly (all models)"))
+    check("weekly exhaustion is announced once", len(h.sent) == 1, repr(titles(h)))
+
+    print("old config shape without 100 in it ('metric': 'session', 'at': [80, 95])")
+    h = Harness()
+    h.cfg["notifications"] = {"enabled": True, "at": [80, 95], "metric": "session"}
+    for pct in (96, 96, 100, 100):
+        h.poll(session=(pct, S1))
+    check("95% and then 'limit reached' - 100% is always announced",
+          titles(h) == ["Claude usage 96%", "session limit reached"], repr(titles(h)))
+
+    print("the old single 'metric' key in config.json")
+    for user, want in (({"metric": "max"}, ["max"]),
+                       ({"metric": "max", "metrics": ["session"]}, ["session"]),
+                       ({}, ["session", "weekly_all", "weekly_scoped"])):
+        with open(app.CONFIG_PATH, "w", encoding="utf-8") as fh:
+            json.dump({"notifications": user}, fh)
+        got = app.load_config()["notifications"]["metrics"]
+        check("%r -> metrics %r" % (user, want), got == want, repr(got))
+    check("the defaults are not changed by it",
+          app.DEFAULT_CONFIG["notifications"]["metrics"] == ["session", "weekly_all", "weekly_scoped"])
+
+    print("session and weekly cross on the same poll")
+    h = Harness(metrics=("session", "weekly_all"))
+    h.poll(session=(96, S1, "Session (5h)"), weekly_all=(100, W1, "Weekly (all models)"))
+    check("one toast that mentions both, not one hiding the other",
+          len(h.sent) == 1 and "Session" in h.sent[0][1] and "Weekly" in h.sent[0][1],
+          repr(h.sent))
+
+    print("two model-scoped weekly limits, reported in alternating order")
+    h = Harness(metrics=("weekly_scoped",))
+    for i in range(10):
+        a = ("weekly_scoped__a", (100, W1, "Weekly (Opus)"))
+        b = ("weekly_scoped__b", (82, W1, "Weekly (Sonnet)"))
+        h.poll(**dict([a, b] if i % 2 else [b, a]))
+    check("each announced once, no flip-flop", len(h.sent) == 1 and len(h.last_notified) == 2,
+          "%d toasts, state=%r" % (len(h.sent), sorted(h.last_notified)))
+
+    print("metric 'max' while the highest limit keeps changing")
+    h = Harness(metrics=("max",))
+    for i in range(10):
+        s, w = (96, 95) if i % 2 else (94, 95)
+        h.poll(session=(s, S1, "Session (5h)"), weekly_all=(w, W1, "Weekly (all models)"))
+    check("no repeat each time the leader changes", len(h.sent) <= 2, repr(titles(h)))
+
+
+def test_delivery():
+    print("a toast held back while you are in a fullscreen app")
+    h = Harness(busy=True)
+    for _ in range(5):
+        h.poll(session=(100, S1))
+    check("nothing shown while busy", len(h.sent) == 0)
+    h.busy = False
+    for _ in range(5):
+        h.poll(session=(100, S1))
+    check("shown once you are back, then not again", len(h.sent) == 1, repr(titles(h)))
+
+    print("signed out for a long while")
+    h = Harness()
+    h.poll(session=(40, S1))
+    for _ in range(30):
+        h.fail(SIGNED_OUT)
+    check("no toast before the grace period", len(h.sent) == 0, repr(titles(h)))
+    h.cfg["notifications"]["signed_out_after"] = 0
+    for _ in range(30):
+        h.fail(SIGNED_OUT)
+    check("exactly one 'not updating' toast", titles(h) == ["Claude usage is not updating"],
+          repr(titles(h)))
+    for error in ("Offline", SIGNED_OUT, "Rate limited by the usage API", SIGNED_OUT):
+        h.fail(error)
+    check("going offline in the middle does not make it a new outage", len(h.sent) == 1,
+          repr(titles(h)))
+    h.poll(session=(40, S1))
+    for _ in range(5):
+        h.fail(SIGNED_OUT)
+    check("a new outage after recovering gets its own single toast", len(h.sent) == 2,
+          repr(titles(h)))
+
+    print("never signed in on this PC")
+    h = Harness()
+    h.cfg["notifications"]["signed_out_after"] = 0
+    h.fail("Not signed in to Claude Code")
+    check("says so, instead of claiming a sign-in expired",
+          len(h.sent) == 1 and "not signed in" in h.sent[0][1] and "expired" not in h.sent[0][1],
+          repr(h.sent))
+
+    print("other errors, for as long as they last")
+    h = Harness()
+    h.cfg["notifications"]["signed_out_after"] = 0
+    for error in ("Offline", "Something went wrong", "Usage API error (HTTP 418)") * 5:
+        h.fail(error)
+    check("never read as a sign-in problem", h.sent == [], repr(titles(h)))
+
+
+REAL_GRANT = {
+    "cedar_ember": {
+        "eligible": True, "ineligible_reason": None, "at_limit": False, "exhausted": [],
+        "grants": [{
+            "id": "opus55-launch-promax-20260921",
+            "label": "Claude Opus 5.5 launch: one usage-limit reset for Pro and Max",
+            "resets_total": 1, "resets_left": 1,
+            "starts_at": "2026-09-22T16:00:00+00:00", "ends_at": "2099-10-22T16:00:00+00:00",
+            "clears": ["five_hour", "seven_day", "seven_day_overage_included"],
+            "paused": False, "usable_now": True, "use_requires_limit": False,
+        }],
+    },
+    "nimbus_quill": {"utilization": 0.0, "resets_at": None},
+}
+
+
+def with_events(h, events):
+    h.usage.events = events
+    return h
+
+
+def test_events():
+    print("parsing the grant the endpoint really returned (expiry moved into the future)")
+    events = app.parse_events(REAL_GRANT)
+    check("one live event", len(events) == 1, repr(events))
+    if events:
+        e = events[0]
+        check("label, count and what it clears survive",
+              e["resets_left"] == 1 and "Opus 5.5" in e["label"]
+              and app.describe_clears(e["clears"]) == "5-hour and weekly limits", repr(e))
+
+    print("grants that are not live are left out")
+    for name, mutate in (("used up", lambda g: g.update(resets_left=0)),
+                         ("expired", lambda g: g.update(ends_at="2020-01-01T00:00:00+00:00")),
+                         ("paused", lambda g: g.update(paused=True))):
+        data = copy.deepcopy(REAL_GRANT)
+        mutate(data["cedar_ember"]["grants"][0])
+        check("%s -> no event" % name, app.parse_events(data) == [])
+    data = copy.deepcopy(REAL_GRANT)
+    data["cedar_ember"]["eligible"] = False
+    check("ineligible (asked as the wrong surface) -> no event", app.parse_events(data) == [])
+    check("a program under a new codename is still found",
+          len(app.parse_events({"brand_new_program": REAL_GRANT["cedar_ember"]})) == 1)
+
+    print("a grant with odd fields")
+    data = copy.deepcopy(REAL_GRANT)
+    data["cedar_ember"]["grants"][0].update(resets_left="one", resets_total={}, clears="five_hour",
+                                            label=None, usable_now=None, ends_at="soon")
+    try:
+        odd = app.parse_events(data)
+        check("is read, not fatal", len(odd) == 1 and odd[0]["clears"] == []
+              and odd[0]["resets_left"] is None and odd[0]["label"] == "Cedar ember", repr(odd))
+    except Exception as exc:
+        check("is read, not fatal", False, repr(exc))
+
+    print("a cached grant that has since expired")
+    u = app.Usage()
+    u.events = [dict(events[0], ends_at="2020-01-01T00:00:00+00:00")] if events else []
+    check("is not displayed, even if no poll has refreshed it", app.live_events(u) == [])
+    u.events = events
+    check("a live one still is", len(app.live_events(u)) == 1)
+
+    print("announcing the event")
+    state = tempfile.mkdtemp()
+    h = with_events(Harness(state), events)
+    h.poll(session=(10, S1))
+    h.poll(session=(10, S1))
+    check("announced once", len(h.sent) == 1 and "reset" in h.sent[0][0].lower(), repr(h.sent))
+    h2 = with_events(Harness(state), events)
+    h2.poll(session=(10, S1))
+    check("not again after a restart", len(h2.sent) == 0, repr(h2.sent))
+    h3 = with_events(Harness(), events)
+    h3.cfg["notifications"]["events"] = False
+    h3.poll(session=(10, S1))
+    check("can be switched off", len(h3.sent) == 0)
+
+    print("a grant appears on the poll that also crosses a threshold")
+    h = with_events(Harness(), events)
+    h.poll(session=(100, S1, "Session (5h)"))
+    check("one toast carrying both, not the grant replacing the limit alert",
+          len(h.sent) == 1 and "Session (5h) limit reached" in h.sent[0][1]
+          and "Free limit reset available" in h.sent[0][1], repr(h.sent))
+    check("and both are recorded", "session" in h.last_notified
+          and "grant:" + events[0]["id"] in h.last_notified, repr(sorted(h.last_notified)))
+
+    print("a grant appears while you are busy")
+    h = with_events(Harness(busy=True), events)
+    for _ in range(3):
+        h.poll(session=(10, S1))
+    h.busy = False
+    h.poll(session=(10, S1))                 # a normal poll, not an event poll
+    h.poll(session=(10, S1))
+    check("announced on the next poll you can see it, once", len(h.sent) == 1, repr(h.sent))
+
+    print("a grant that cannot be used yet")
+    h = with_events(Harness(), [dict(events[0], usable_now=False)])
+    h.poll(session=(10, S1))
+    check("is not announced as available", h.sent == [], repr(h.sent))
+    h.usage.events = events
+    h.poll(session=(10, S1))
+    check("until it is", len(h.sent) == 1, repr(h.sent))
+
+
+def test_parsing():
+    print("usage pools")
+    pools = app.extra_buckets({
+        "five_hour": {"utilization": 10}, "seven_day": {"utilization": 20},
+        "seven_day_opus": {"utilization": 40}, "seven_day_sonnet": {"utilization": 5},
+        "omelette_promotional": {"utilization": 0}, "nimbus_quill": {"utilization": 0.0},
+        "broken_pool": {"utilization": "lots"}, "tangelo": None,
+    })
+    keys = sorted(p["key"] for p in pools)
+    check("per-model weekly pools are left to `limits`, garbage is skipped",
+          keys == ["nimbus_quill", "omelette_promotional"], repr(keys))
+
+    print("the weekly breakdown")
+    rows = app.breakdown_rows({"seven_day_breakdown": {"rows": [
+        {"key": "claude_code", "display_name": "Claude Code", "percent": 12.5, "secret": "x"},
+        {"key": "chat", "percent": "n/a"}, "junk"]}})
+    check("only the shown fields are kept, odd rows skipped",
+          rows == [{"key": "claude_code", "display_name": "Claude Code", "percent": 12.5}],
+          repr(rows))
+    check("a breakdown of the wrong shape is empty, not fatal",
+          app.breakdown_rows({"seven_day_breakdown": ["rows"]}) == [])
+
+    print("the Claude Code version, when it has to come from ~/.claude.json")
+    home = tempfile.mkdtemp()
+    saved = {k: os.environ.get(k) for k in ("USERPROFILE", "HOME")}
+    try:
+        os.environ["USERPROFILE"] = os.environ["HOME"] = home
+        for seen, want in (("2.1.99", "claude-cli/2.1.99 (external, cli)"),
+                           ("2.1.99) evil (", "claude-cli/2.1.0 (external, cli)"),
+                           (7, "claude-cli/2.1.0 (external, cli)")):
+            with open(os.path.join(home, ".claude.json"), "w", encoding="utf-8") as fh:
+                json.dump({"lastReleaseNotesSeen": seen}, fh)
+            got = app.claude_code_user_agent()
+            check("%r -> %s" % (seen, want), got == want, got)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+class Poller(Harness):
+    """apply_pending with the UI around it stubbed out."""
+
+    apply_pending = app.TrayApp.apply_pending
+    event_poll_due = app.TrayApp.event_poll_due
+    _event_check_failed = app.TrayApp._event_check_failed
+    note_rate_limit = app.TrayApp.note_rate_limit
+    _back_off = app.TrayApp._back_off
+
+    def __init__(self):
+        Harness.__init__(self)
+        self._lock = threading.Lock()
+        self._pending = None
+        self._fetching = False
+        self.flyout = None
+        self.backoff, self.retry_at = 0, 0
+        self.fetches = []
+
+    def update_icon(self):
+        pass
+
+    def start_fetch(self, manual=False, events=None):
+        self.fetches.append((manual, events))
+
+    def deliver(self, with_events, error=None, status=None, events=(), spend="S", pct=20.0):
+        r = app.Usage()
+        r.with_events = with_events
+        r.error, r.status = error, status
+        if not error:
+            r.limits = [{"key": "session", "label": "Session (5h)", "percent": pct,
+                         "resets_at": stamp(S1), "severity": "normal", "group": "session"}]
+            r.updated = datetime.now()
+            r.spend = None if with_events else spend
+            if with_events and events is not None:
+                r.events = list(events)
+                r.events_checked = time.time()
+        self._pending = r
+        self.apply_pending()
+
+
+def test_event_poll():
+    print("folding the event check into the regular poll")
+    grant = app.parse_events(REAL_GRANT)
+    p = Poller()
+    check("the first poll is an event poll", p.event_poll_due())
+    p.deliver(False, spend="SPEND")
+    p.deliver(True, events=grant)
+    check("an event poll sets the events and announces them",
+          [e["id"] for e in (p.usage.events or [])] == ["opus55-launch-promax-20260921"]
+          and len(p.sent) == 1, repr(p.sent))
+    check("and keeps the spend it skipped", p.usage.spend == "SPEND", repr(p.usage.spend))
+    check("no event poll again within the hour", not p.event_poll_due())
+    p.deliver(False, spend="SPEND2")
+    check("a normal poll inherits the events", len(p.usage.events or []) == 1)
+
+    print("an event poll that is rate limited")
+    p = Poller()
+    p.deliver(True, error="Rate limited by the usage API", status=429)
+    check("leaves the answer unknown", p.usage.events is None)
+    check("and the next poll is a plain one, so usage keeps updating", not p.event_poll_due())
+    p.events_retry_at = time.time() - 1
+    check("the event check is tried again once its own backoff is over", p.event_poll_due())
+    p.deliver(True, error="Rate limited by the usage API", status=429)
+    first = p._event_backoff
+    p.deliver(True, error="Rate limited by the usage API", status=429)
+    check("and backs off further each time it fails", p._event_backoff > first,
+          "%d then %d" % (first, p._event_backoff))
+
+    print("an event poll refused outright (401/403)")
+    p = Poller()
+    p.deliver(False, pct=33.0)
+    p.cfg["notifications"]["signed_out_after"] = 0
+    p.deliver(True, error=SIGNED_OUT, status=403)
+    check("is not shown as signed out", p.usage.error is None and p._signed_out_since is None
+          and p.sent == [], repr(p.usage.error))
+    check("the numbers are asked for again right away, the plain way",
+          p.fetches == [(True, False)], repr(p.fetches))
+    check("and the event check waits", not p.event_poll_due())
+    p.deliver(False, error=SIGNED_OUT, status=401)
+    check("while a plain 401 still is a real sign-out", p.usage.error == SIGNED_OUT)
+
+    print("an event poll whose grants cannot be read")
+    p = Poller()
+    p.usage.events = grant
+    p.deliver(True, events=None, pct=44.0)
+    check("still delivers the numbers", p.usage.error is None
+          and p.usage.limits[0]["percent"] == 44.0)
+    check("keeps the grants it knew", len(p.usage.events or []) == 1)
+    check("and does not retry the event check on every poll", not p.event_poll_due())
+
+    print("choosing the kind of request")
+
+    class Fetcher(Poller):
+        start_fetch = app.TrayApp.start_fetch
+
+    asked = []
+
+    def fake_fetch(events=False):
+        asked.append(events)
+        r = app.Usage()
+        r.with_events = events
+        return r
+
+    real_fetch = app.fetch_usage
+    app.fetch_usage = fake_fetch
+    try:
+        def ask(f, **kw):
+            f._pending = None
+            f.start_fetch(**kw)
+            for _ in range(200):
+                if f._pending is not None:
+                    break
+                time.sleep(0.01)
+            return asked[-1] if asked else None
+
+        f = Fetcher()
+        f.usage.events, f.usage.events_checked = grant, time.time()
+        check("a timed poll inside the hour is plain", ask(f) is False)
+        check("the Refresh button re-checks events", ask(f, manual=True) is True)
+        f.cfg["check_events"] = False
+        f.usage.events = None
+        check("check_events: false - never an event poll, timed",
+              ask(f) is False and not f.event_poll_due())
+        check("... or manual", ask(f, manual=True) is False)
+    finally:
+        app.fetch_usage = real_fetch
+
+    p = Poller()
+    p.usage.events = grant
+    p.cfg["check_events"] = False
+    p.deliver(False)
+    check("and cached grants are dropped once it is off", p.usage.events is None)
+
+
+def test_flyout_key():
+    print("the flyout's change detection")
+    u = app.Usage()
+    u.limits = [{"key": "session", "label": "Session (5h)", "percent": 20.0, "resets_at": None}]
+    u.updated = datetime.now()
+    a = app.Flyout.content_key(u)
+    check("the same data gives the same key", a == app.Flyout.content_key(u))
+    u.events = app.parse_events(REAL_GRANT)
+    check("a grant appearing changes it", a != app.Flyout.content_key(u))
+
+
+def main():
+    for test in (test_spam, test_coverage, test_delivery, test_events, test_parsing,
+                 test_event_poll, test_flyout_key):
+        test()
+    print()
+    if FAILURES:
+        print("%d FAILED: %s" % (len(FAILURES), ", ".join(FAILURES)))
+        return 1
+    print("all passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

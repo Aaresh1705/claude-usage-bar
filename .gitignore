@@ -11,3 +11,4 @@ config.json
 dist/
 build/
 *.spec
+.notify_state.json

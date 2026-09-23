@@ -141,6 +141,7 @@ you can keep a minimal file with just your overrides.
 | `left_click` | `flyout`, `refresh`, or `web`. Applies to the tray icons and the overlay. |
 | `tray.enabled` | Draw the tray icons at all. Turn it off to run overlay-only. |
 | `usage_page_url` | Where "Open usage page" goes. |
+| `check_events` | Look for promotional grants once an hour (see *Events*). `false` never sends the request that identifies as Claude Code. Default `true`. |
 | `tooltip_template` | See placeholders below. |
 
 ### `icon`
@@ -298,8 +299,78 @@ each percentage. Add as many stops as you like:
 
 ### `notifications`
 
-`{"enabled": true, "at": [80, 95], "metric": "session"}` — a balloon fires once per
-threshold per limit window, and re-arms when the window resets.
+```json
+{"enabled": true, "at": [80, 95, 100],
+ "metrics": ["session", "weekly_all", "weekly_scoped"],
+ "events": true, "signed_out_after": 900}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `at` | Percentages to warn at. Reaching 100% is always announced ("Session (5h) limit reached"), whether or not it is listed. |
+| `metrics` | Which limits to watch: `session`, `weekly_all`, `weekly_scoped` (every model-scoped weekly limit, each on its own), or `max` (whichever is highest). The old single `"metric"` key still works. |
+| `events` | Announce a live promotion (see *Events*) once, when it can be used. |
+| `signed_out_after` | Seconds of refused sign-in (or no Claude Code sign-in on this PC at all) before one "Claude usage is not updating" nudge. |
+
+The rules, all covered by `tests/test_notifications.py`:
+
+* **Once per threshold per limit window.** Never twice for the same level, never
+  again for a level already passed, not again when usage dips below and back.
+* **A limit reset re-arms them.** Inside one window usage only falls to under half
+  the lowest threshold when the limit was reset early - a redeemed limit reset -
+  so running out again after that is announced again.
+* **A window is its reset time, rounded to the minute.** The API reports the same
+  reset instant with different microseconds on every request
+  (`12:10:00.165535`, then `12:10:00.134418`). Comparing the raw strings made
+  every poll look like a new window, so an hour at 100% produced 60
+  notifications. Rounded, it produces one.
+* **Remembered across restarts** in `.notify_state.json`, so rebooting at 100%
+  does not announce it again.
+* **Everything due on one poll shares a toast** - several limits, or a limit and
+  a new event - instead of one replacing the other.
+* **Held back, not dropped.** While Windows says you are busy (a game, a
+  fullscreen video, a presentation) nothing is shown - and nothing is marked as
+  shown, so it appears once you are back.
+* Errors and rate limiting never trigger anything, however they flap. The one
+  exception is sign-in: refused for `signed_out_after` seconds, you get a single
+  nudge per outage - and going offline in the middle of it does not start a new
+  one.
+
+### Events
+
+The usage endpoint also reports promotional **grants** - right now, the one from
+the Claude Opus 5.5 launch: *one usage-limit reset for Pro and Max, which puts
+the 5-hour and weekly limits back to full, usable until 22 Oct 2026*. While one
+is live the widget shows a small amber sparkle in its corner, the flyout opens
+with a card saying what it is, how many are left, what it clears and when it
+expires (with a button to Settings > Usage, where you redeem it), and a toast
+announces it once.
+
+Two details worth knowing:
+
+* **The endpoint only tells Claude Code.** Asked by anything else it answers
+  `"eligible": false, "ineligible_reason": "surface"`. So one poll an hour - the
+  only request that does this - asks for grants (`?cedar_ember=1`) using the user
+  agent of the Claude Code installed on this machine, read from
+  `~/.local/share/claude/versions`. That poll carries the usual usage data too, so
+  checking for events never costs an extra request against a rate limit that is
+  already tight.
+* **Grants are read by shape, not by name.** Any program in the response that
+  carries a `grants` list is picked up, so the next promotion appears without a
+  code change. The app only displays grants; it never redeems one.
+* **The event check can never hold up the numbers.** If that poll fails, is
+  refused, or returns grants it cannot read, the usage is still used (or asked
+  for again the plain way straight away), and the event check backs off on its
+  own clock - 5 minutes, doubling to an hour - while ordinary polls carry on.
+  **Refresh** re-checks events too, so a reset you have just used stops being
+  advertised at once. `check_events: false` turns the whole thing off.
+
+The flyout also shows **where this week's usage went** (Claude Code, chats,
+Cowork, …) as a split bar, from the endpoint's weekly breakdown, and any other
+usage pool the endpoint reports once it is actually in use.
+
+`taskbar_widget.show_events` (default `true`) and `taskbar_widget.event_color`
+(default `#F59E0B`) control the sparkle.
 
 ### `flyout`
 
@@ -401,6 +472,7 @@ success / caution / critical colours.
 | `install.ps1` | Install, update (`-Update`), uninstall (`-Uninstall`). Registers the logon task; `-UseStartupFolder` for the old shortcut. |
 | `build.ps1` | Builds the standalone `dist\ClaudeUsageBar.exe`. |
 | `make_icon.py` | Draws `assets\ClaudeUsageBar.ico` for the exe and the shortcut. |
+| `tests/test_notifications.py` | The notification and event rules, driven through the real code. `python tests/test_notifications.py`. |
 | `make_preview.py` | Redraws `preview.png` by calling the widget's own renderer, so the README picture cannot drift from the app. |
 | `preview.png` | The widget at 14%, 72%, 96%, 100% and rate-limited, light and dark. |
 | `assets/` | The app icon. |
