@@ -1013,9 +1013,48 @@ def test_ollama():
     check("and the rest of config.json is left alone", saved_cfg.get("refresh_seconds") == 60)
 
 
+def test_window_procedures():
+    print("clicks and menu commands arriving in a window procedure")
+
+    class Clicks(object):
+        _wndproc = app.TrayApp._wndproc
+        defer = app.TrayApp.defer
+        run_deferred = app.TrayApp.run_deferred
+
+        def __init__(self):
+            self._deferred, self.ran = [], []
+            self.wm_taskbar_created = 0xC0DE
+            self.cfg = {"left_click": "flyout"}
+
+        def on_command(self, cmd):
+            self.ran.append(("command", cmd))
+
+        def show_menu(self):
+            self.ran.append(("menu",))
+
+        def left_click(self):
+            self.ran.append(("left",))
+
+    c = Clicks()
+    c._wndproc(None, app.WM_COMMAND, app.CMD_PROVIDER + 1, 0)
+    c._wndproc(None, app.WM_TRAY, 0, app.WM_LBUTTONUP)
+    c._wndproc(None, app.WM_TRAY, 0, app.WM_RBUTTONUP)
+    widget = object.__new__(app.TaskbarWidget)
+    widget.app = c
+    widget._on_message(app.WM_LBUTTONUP, 0, 0)
+    widget._on_message(app.WM_RBUTTONUP, 0, 0)
+    check("nothing runs inside the window procedure, where calling Tk aborts the process",
+          c.ran == [] and len(c._deferred) == 5, repr(c.ran))
+    c.run_deferred()
+    check("the pump then runs each, in order",
+          c.ran == [("command", app.CMD_PROVIDER + 1), ("left",), ("menu",), ("left",), ("menu",)],
+          repr(c.ran))
+
+
 def main():
     for test in (test_spam, test_coverage, test_delivery, test_events, test_parsing,
-                 test_event_poll, test_pacing, test_a_day, test_flyout_key, test_ollama):
+                 test_event_poll, test_pacing, test_a_day, test_flyout_key, test_ollama,
+                 test_window_procedures):
         test()
     print()
     if FAILURES:

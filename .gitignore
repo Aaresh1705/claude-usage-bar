@@ -13,3 +13,4 @@ build/
 *.spec
 .notify_state.json
 .poll_state*.json
+claude_usage_bar.crash.log

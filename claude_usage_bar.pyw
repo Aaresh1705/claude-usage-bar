@@ -11,6 +11,7 @@ import base64
 import calendar
 import ctypes
 import ctypes.wintypes as wt
+import faulthandler
 import hashlib
 import json
 import math
@@ -58,6 +59,7 @@ except Exception:
 
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 LOG_PATH = os.path.join(DATA_DIR, "claude_usage_bar.log")
+CRASH_LOG = os.path.join(DATA_DIR, "claude_usage_bar.crash.log")
 FALLBACK_LOG = os.path.join(os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP", "."),
                             "claude-usage-bar", "claude_usage_bar.log")
 ICON_CACHE = os.path.join(DATA_DIR, ".icons")
@@ -65,7 +67,7 @@ USAGE_CACHE = os.path.join(DATA_DIR, ".usage_cache.json")
 NOTIFY_STATE = os.path.join(DATA_DIR, ".notify_state.json")
 POLL_STATE = os.path.join(DATA_DIR, ".poll_state.json")
 CRED_PATH = os.path.expanduser(os.path.join("~", ".claude", ".credentials.json"))
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 OLLAMA_URL = "https://ollama.com"
 OLLAMA_USAGE_PAGE = "https://ollama.com/settings/usage"
@@ -1687,6 +1689,7 @@ class TrayApp(object):
         self.widget = None
         self.toast = None
         self.locked = False
+        self._deferred = []              # clicks and commands, for the pump to run
         self.sources = {}                # key -> Source, for the enabled ones
         self.sync_sources()
 
@@ -1700,9 +1703,9 @@ class TrayApp(object):
         wc.hInstance = self.hinst
         wc.lpszClassName = "ClaudeUsageBarWnd"
         self.atom = user32.RegisterClassW(ctypes.byref(wc))
+        self.wm_taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")
         self.hwnd = user32.CreateWindowExW(0, "ClaudeUsageBarWnd", "Claude Usage Bar",
                                            0, 0, 0, 0, 0, None, None, self.hinst, None)
-        self.wm_taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")
         # Told when the session locks and unlocks: nobody reads a locked screen,
         # so polling pauses until you are back.
         try:
@@ -1944,22 +1947,46 @@ class TrayApp(object):
         elif cmd == CMD_QUIT:
             self.quit()
 
+    def defer(self, fn, *args):
+        """Run `fn` from the pump instead of here.
+
+        Window procedures are called by whoever dispatches the message - and
+        half the time that is Tk's own event loop, not our pump. Calling back
+        into Tk from there (opening or destroying the flyout, a toast) leaves
+        tkinter's record of the thread state empty, and the next Tk callback
+        aborts the whole process with "Fatal Python error:
+        PyEval_RestoreThread". Switching a provider on did exactly that, via
+        the config reload destroying the flyout. So window procedures only
+        queue work; the pump, an ordinary Tk callback, carries it out."""
+        self._deferred.append((fn, args))
+
+    def run_deferred(self):
+        while self._deferred:
+            fn, args = self._deferred.pop(0)
+            try:
+                fn(*args)
+            except Exception:
+                log("%s failed: %s" % (getattr(fn, "__name__", fn), traceback.format_exc()))
+
+    def left_click(self):
+        action = self.cfg.get("left_click", "flyout")
+        if action == "flyout":
+            self.toggle_flyout()
+        elif action == "refresh":
+            self.start_fetch(manual=True)
+        elif action == "web":
+            webbrowser.open(self.usage_page())
+
     def _wndproc(self, hwnd, msg, wparam, lparam):
         if msg == WM_TRAY:
             event = lparam & 0xFFFF
             if event in (WM_LBUTTONUP, NIN_SELECT):
-                action = self.cfg.get("left_click", "flyout")
-                if action == "flyout":
-                    self.toggle_flyout()
-                elif action == "refresh":
-                    self.start_fetch(manual=True)
-                elif action == "web":
-                    webbrowser.open(self.usage_page())
+                self.defer(self.left_click)
             elif event in (WM_RBUTTONUP, WM_CONTEXTMENU):
-                self.show_menu()
+                self.defer(self.show_menu)
             return 0
         if msg == WM_COMMAND:
-            self.on_command(wparam & 0xFFFF)
+            self.defer(self.on_command, wparam & 0xFFFF)
             return 0
         if msg == self.wm_taskbar_created:
             self.registered = 0
@@ -3081,27 +3108,19 @@ class TaskbarWidget(object):
         return True
 
     def _on_message(self, msg, wparam, lparam):
-        """Return None for anything we don't handle."""
+        """Return None for anything we don't handle. Clicks are handed to the
+        pump rather than acted on here - see TrayApp.defer."""
         if msg == WM_LBUTTONUP:
-            self._on_left()
+            self.app.defer(self.app.left_click)
             return 0
         if msg == WM_RBUTTONUP:
-            self.app.show_menu()
+            self.app.defer(self.app.show_menu)
             return 0
         if msg in (WM_DISPLAYCHANGE, WM_SETTINGCHANGE, WM_DPICHANGED, WM_THEMECHANGED):
             self.geometry = None      # re-measure against the new taskbar/theme
             self._last_key = None
             return 0
         return None
-
-    def _on_left(self):
-        action = self.app.cfg.get("left_click", "flyout")
-        if action == "flyout":
-            self.app.toggle_flyout()
-        elif action == "refresh":
-            self.app.start_fetch(manual=True)
-        elif action == "web":
-            webbrowser.open(self.app.usage_page())
 
     def cfg(self):
         return self.app.cfg.get("taskbar_widget") or {}
@@ -3650,9 +3669,22 @@ def single_instance():
     return kernel32.WaitForSingleObject(_instance_mutex, 1500) in (0, 0x80)
 
 
+def enable_crash_log():
+    """A fatal error inside Python or Tcl aborts the process, and under
+    pythonw its one-line explanation goes to a console that does not exist.
+    faulthandler writes the stack of every thread to a file instead."""
+    global _crash_file
+    try:
+        _crash_file = open(CRASH_LOG, "a", encoding="utf-8")
+        faulthandler.enable(file=_crash_file, all_threads=True)
+    except Exception:
+        pass
+
+
 def main():
     global root
     log("starting v%s (pid %d, %s)" % (VERSION, os.getpid(), sys.executable))
+    enable_crash_log()
     if not single_instance():
         log("another instance is running; exiting")
         return
@@ -3690,6 +3722,7 @@ def main():
         while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
+        app.run_deferred()
         app.apply_pending()
 
     every("pump", 50, pump, first_ms=50)

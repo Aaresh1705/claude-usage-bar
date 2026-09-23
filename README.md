@@ -510,7 +510,7 @@ with the numbers never more than 5 minutes old.
 * Only one instance runs. The lock is a per-session named mutex, and
   `ERROR_ALREADY_EXISTS` is only honoured when the other instance's window
   actually answers — a leftover lock can't stop the app from starting again.
-* Every launch writes a `starting v1.2.0 (pid …)` line to the log, so "it didn't come
+* Every launch writes a `starting v1.2.1 (pid …)` line to the log, so "it didn't come
   back after a reboot" is answerable. A line means it started - compare its
   timestamp with `(Get-CimInstance Win32_OperatingSystem).LastBootUpTime` to see
   how long the shell took to get to it. No line at all means Windows never
