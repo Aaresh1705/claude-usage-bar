@@ -16,7 +16,8 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime
+import types
+from datetime import datetime, timedelta
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.join(os.path.dirname(HERE), "claude_usage_bar.pyw")
@@ -37,7 +38,8 @@ app = load_app()
 # state, the config - goes to a scratch directory. Without this the tests wrote
 # into the real app's files, and the running widget picked up a made-up event.
 _SANDBOX = tempfile.mkdtemp(prefix="claude-usage-bar-tests-")
-for _name in ("LOG_PATH", "FALLBACK_LOG", "USAGE_CACHE", "NOTIFY_STATE", "CONFIG_PATH"):
+for _name in ("LOG_PATH", "FALLBACK_LOG", "USAGE_CACHE", "NOTIFY_STATE", "POLL_STATE",
+              "CONFIG_PATH"):
     setattr(app, _name, os.path.join(_SANDBOX, os.path.basename(getattr(app, _name))))
 
 _micro = itertools.count(100000, 7919)
@@ -421,32 +423,45 @@ def test_parsing():
 
 
 class Poller(Harness):
-    """apply_pending with the UI around it stubbed out."""
+    """The poll loop and apply_pending, with the network and the UI stubbed out."""
 
     apply_pending = app.TrayApp.apply_pending
     event_poll_due = app.TrayApp.event_poll_due
     _event_check_failed = app.TrayApp._event_check_failed
-    note_rate_limit = app.TrayApp.note_rate_limit
-    _back_off = app.TrayApp._back_off
+    plan_next_poll = app.TrayApp.plan_next_poll
+    base_interval = app.TrayApp.base_interval
+    poll_interval = app.TrayApp.poll_interval
+    first_poll_at = app.TrayApp.first_poll_at
+    on_unlock = app.TrayApp.on_unlock
+    maybe_poll = app.TrayApp.maybe_poll
+    start_fetch = app.TrayApp.start_fetch
 
-    def __init__(self):
-        Harness.__init__(self)
+    def __init__(self, state_dir=None):
+        Harness.__init__(self, state_dir)
+        self.cfg["refresh_seconds"] = 60             # what existing config.json files say
         self._lock = threading.Lock()
         self._pending = None
         self._fetching = False
         self.flyout = None
-        self.backoff, self.retry_at = 0, 0
+        self.poll_path = os.path.join(os.path.dirname(self.state_path), ".poll_state.json")
+        saved = app.load_poll_state(self.poll_path)
+        self.pace, self.pace_at = saved.get("pace", 0.0), saved.get("pace_at", 0.0)
+        self.last_request = saved.get("last_request", 0.0)
+        self.backoff, self.retry_at = saved.get("backoff", 0.0), saved.get("retry_at", 0.0)
+        self._unchanged, self._last_seen, self.locked = 0, None, False
+        self.next_poll_at = 0.0
         self.fetches = []
 
     def update_icon(self):
         pass
 
-    def start_fetch(self, manual=False, events=None):
-        self.fetches.append((manual, events))
+    def _fetch(self, events, manual=False):
+        self.fetches.append((events, manual))
 
-    def deliver(self, with_events, error=None, status=None, events=(), spend="S", pct=20.0):
+    def deliver(self, with_events, error=None, status=None, events=(), spend="S", pct=20.0,
+                manual=False):
         r = app.Usage()
-        r.with_events = with_events
+        r.with_events, r.manual = with_events, manual
         r.error, r.status = error, status
         if not error:
             r.limits = [{"key": "session", "label": "Session (5h)", "percent": pct,
@@ -496,7 +511,7 @@ def test_event_poll():
     check("is not shown as signed out", p.usage.error is None and p._signed_out_since is None
           and p.sent == [], repr(p.usage.error))
     check("the numbers are asked for again right away, the plain way",
-          p.fetches == [(True, False)], repr(p.fetches))
+          p.fetches == [(False, False)], repr(p.fetches))
     check("and the event check waits", not p.event_poll_due())
     p.deliver(False, error=SIGNED_OUT, status=401)
     check("while a plain 401 still is a real sign-out", p.usage.error == SIGNED_OUT)
@@ -513,7 +528,7 @@ def test_event_poll():
     print("choosing the kind of request")
 
     class Fetcher(Poller):
-        start_fetch = app.TrayApp.start_fetch
+        _fetch = app.TrayApp._fetch
 
     asked = []
 
@@ -528,6 +543,7 @@ def test_event_poll():
     try:
         def ask(f, **kw):
             f._pending = None
+            f.last_request = 0.0                # not a double press of Refresh
             f.start_fetch(**kw)
             for _ in range(200):
                 if f._pending is not None:
@@ -554,6 +570,202 @@ def test_event_poll():
     check("and cached grants are dropped once it is off", p.usage.events is None)
 
 
+RL = "Rate limited by the usage API"
+
+
+def test_pacing():
+    print("the pace")
+    p = Poller()
+    check("config.json's 60 s is raised to the 120 s the endpoint sustains",
+          p.base_interval() == 120, repr(p.base_interval()))
+    p.cfg["refresh_seconds"] = 600
+    check("a slower setting is kept", p.base_interval() == 600)
+
+    print("numbers standing still, then moving")
+    p = Poller()
+    gaps = []
+    for _ in range(5):
+        p.deliver(False, pct=20.0)
+        gaps.append(round(p.next_poll_at - time.time()))
+    check("each unchanged poll waits longer, up to five minutes",
+          gaps == [120, 180, 270, 300, 300], repr(gaps))
+    p.deliver(False, pct=21.0)
+    check("the first change snaps back", round(p.next_poll_at - time.time()) == 120)
+
+    print("a 429 on a timed poll")
+    p = Poller()
+    p.deliver(False, error=RL, status=429)
+    check("waits out a backoff", p.retry_at - time.time() > 100 and p.next_poll_at == p.retry_at)
+    check("and slows the pace itself", abs(p.base_interval() - 150) < 0.01,
+          repr(p.base_interval()))
+    p.deliver(False, error=RL, status=429)
+    check("further each time", p.base_interval() > 150 and p.backoff == 240,
+          "%r %r" % (p.base_interval(), p.backoff))
+    learned = p.base_interval()
+    p.deliver(False, pct=20.0)
+    check("a success ends the backoff but keeps the pace",
+          p.retry_at == 0 and abs(p.base_interval() - learned) < 0.01)
+    p.pace_at -= 6 * 3600
+    check("what it learned fades by a tenth per six hours without another",
+          abs(p.base_interval() - learned * 0.9) < 0.5, repr(p.base_interval()))
+    p.pace_at -= 30 * 24 * 3600
+    check("and is gone in the end", p.base_interval() == 120)
+
+    print("restarting")
+    state = tempfile.mkdtemp()
+    p = Poller(state)
+    p.deliver(False, error=RL, status=429)
+    q = Poller(state)
+    check("keeps the pace and the backoff", abs(q.base_interval() - 150) < 0.01
+          and abs(q.retry_at - p.retry_at) < 0.01, "%r" % q.base_interval())
+    q.usage.limits = [{"key": "session", "label": "Session (5h)", "percent": 20.0}]
+    q.usage.updated = datetime.now()
+    check("and does not poll before the backoff is over", q.first_poll_at() >= p.retry_at - 0.01)
+    q = Poller()
+    q.usage.limits = [{"key": "session", "label": "Session (5h)", "percent": 20.0}]
+    q.usage.updated = datetime.now() - timedelta(seconds=30)
+    q.last_request = time.time() - 30
+    check("with numbers 30 s old in the cache, the first request waits till they are due",
+          85 < q.first_poll_at() - time.time() <= 91, repr(q.first_poll_at() - time.time()))
+    q.usage.limits = []
+    check("with nothing cached it asks within a minute of the last run's request",
+          25 < q.first_poll_at() - time.time() <= 31)
+
+    print("the Refresh button")
+    p = Poller()
+    p.deliver(False, error=RL, status=429, manual=True)
+    check("into a rate limit: waits, but does not slow the pace",
+          p.base_interval() == 120 and p.retry_at > time.time() + 100)
+    p = Poller()
+    p.last_request = time.time() - 5
+    p.start_fetch(manual=True)
+    check("pressed right after a request: asks nothing", p.fetches == [])
+    p.last_request = time.time() - 20
+    p.start_fetch(manual=True)
+    check("otherwise asks, and re-checks events", p.fetches == [(True, True)], repr(p.fetches))
+
+    print("the timer")
+    p = Poller()
+    p.next_poll_at = time.time() + 60
+    p.maybe_poll()
+    check("does nothing before a poll is due", p.fetches == [])
+    p.next_poll_at = time.time() - 1
+    p.locked = True
+    p.maybe_poll()
+    check("nor while the screen is locked", p.fetches == [])
+    p.locked = False
+    p.maybe_poll()
+    check("and polls once due and unlocked", len(p.fetches) == 1)
+
+    print("unlocking")
+    p = Poller()
+    p.last_request, p.next_poll_at = time.time() - 600, time.time() + 250
+    p.on_unlock()
+    check("fresh numbers within seconds", p.next_poll_at - time.time() <= 3.5)
+    p.last_request, p.next_poll_at = time.time() - 30, time.time() + 250
+    p.on_unlock()
+    check("but not on top of a request a moment ago", 85 < p.next_poll_at - time.time() <= 91)
+
+    print("what a rate limit looks like")
+    u = app.Usage()
+    u.limits = [{"key": "session", "label": "Session (5h)", "percent": 20.0}]
+    u.updated, u.error, u.status = datetime.now(), RL, 429
+    check("numbers minutes old: no error to show", app.shown_error(u) is None)
+    u.updated = datetime.now() - timedelta(minutes=20)
+    check("numbers 20 minutes old: say why", app.shown_error(u) == RL)
+    u.updated, u.error, u.status = datetime.now(), "Offline", None
+    check("other errors always show", app.shown_error(u) == "Offline")
+
+
+class Endpoint(object):
+    """A token bucket fitted to the log: about one request per 100 s sustained,
+    a burst of a few, 429 when empty."""
+
+    def __init__(self, capacity=5.0, per_second=1 / 100.0):
+        self.capacity, self.rate = capacity, per_second
+        self.tokens, self.t = capacity, 0.0
+
+    def take(self, now):
+        self.tokens = min(self.capacity, self.tokens + (now - self.t) * self.rate)
+        self.t = now
+        if self.tokens >= 1:
+            self.tokens -= 1
+            return True
+        return False
+
+
+def test_a_day():
+    print("a simulated day: the endpoint allows ~1 request per 100 s, and Claude Code")
+    print("uses the same allowance every 5 minutes during 8 working hours")
+    day, step = 24 * 3600, 5
+
+    def working(t):
+        return 8 * 3600 <= t < 16 * 3600
+
+    def pct_at(t):                   # usage climbs while you work, stands still otherwise
+        return min(100.0, max(0.0, (min(t, 16 * 3600) - 8 * 3600) / 600.0))
+
+    # The old way: every 60 s, and 120 s (doubling) after a 429.
+    ep, old_refused, old_requests, next_at, backoff = Endpoint(), 0, 0, 0, 0
+    for t in range(0, day, step):
+        if working(t) and t % 300 == 0:
+            ep.take(t)
+        if t >= next_at:
+            old_requests += 1
+            if ep.take(t):
+                backoff, next_at = 0, t + 60
+            else:
+                old_refused += 1
+                backoff = min(max(backoff * 2, 120), 1800)
+                next_at = t + backoff
+
+    # The new way, through the app's own poll loop on a fake clock.
+    ep, clock = Endpoint(), [0.0]
+    sim = Poller()
+    sim.requests, sim.refused, sim.successes = 0, 0, []
+
+    def fake_fetch(events, manual=False):
+        now = clock[0]
+        sim.last_request = now
+        sim.requests += 1
+        r = app.Usage()
+        r.with_events, r.manual = events, manual
+        if ep.take(now):
+            sim.successes.append(now)
+            r.limits = [{"key": "session", "label": "Session (5h)", "percent": pct_at(now),
+                         "resets_at": None, "severity": "normal", "group": "session"}]
+            r.updated = datetime.now()
+            if events:
+                r.events, r.events_checked = [], now
+        else:
+            sim.refused += 1
+            r.error, r.status = RL, 429
+        sim._pending = r
+
+    sim._fetch = fake_fetch
+    real_time = app.time
+    app.time = types.SimpleNamespace(time=lambda: clock[0])
+    try:
+        for t in range(0, day, step):
+            clock[0] = float(t)
+            if working(t) and t % 300 == 0:
+                ep.take(t)
+            sim.maybe_poll()
+            if sim._pending is not None:
+                sim.apply_pending()
+    finally:
+        app.time = real_time
+    gaps = [b - a for a, b in zip(sim.successes, sim.successes[1:])]
+    print("    old: %d requests, %d refused" % (old_requests, old_refused))
+    print("    new: %d requests, %d refused, longest wait for fresh numbers %ds"
+          % (sim.requests, sim.refused, max(gaps or [0])))
+    check("the old pacing really did run into the limit all day", old_refused > 100,
+          "%d refused" % old_refused)
+    check("the new pacing is refused a handful of times a day at most", sim.refused <= 5,
+          "%d refused" % sim.refused)
+    check("and never leaves the numbers more than 10 minutes old", max(gaps or [0]) <= 600)
+
+
 def test_flyout_key():
     print("the flyout's change detection")
     u = app.Usage()
@@ -567,7 +779,7 @@ def test_flyout_key():
 
 def main():
     for test in (test_spam, test_coverage, test_delivery, test_events, test_parsing,
-                 test_event_poll, test_flyout_key):
+                 test_event_poll, test_pacing, test_a_day, test_flyout_key):
         test()
     print()
     if FAILURES:

@@ -135,7 +135,7 @@ you can keep a minimal file with just your overrides.
 
 | Key | Meaning |
 | --- | --- |
-| `refresh_seconds` | Poll interval. 60 is comfortable; the endpoint is cheap but don't go below ~15. |
+| `refresh_seconds` | How often to poll while usage is changing. Default 120, which is also the minimum: the endpoint refuses anything much faster (see *Rate limits*). Set it higher to poll less. |
 | `primary_metric` | What the big number/pill shows: `session`, `weekly_all`, `weekly_scoped`, or `max` (whichever limit is currently highest). |
 | `secondary_metric` | What the thin strip shows. Same values, or `null` to drop it. |
 | `left_click` | `flyout`, `refresh`, or `web`. Applies to the tray icons and the overlay. |
@@ -416,6 +416,39 @@ success / caution / critical colours.
 {"primary_metric": "max", "icon": {"style": "ring", "ring_thickness": 0.28}}
 ```
 
+## Rate limits
+
+The usage endpoint is internal and undocumented, and its rate limit is set on
+Anthropic's side, per account - there is no way to raise it, and its 429s carry
+no hint of how long to wait (`Retry-After: 0`). Measured from this app's own
+log, it sustains about **one request per 100 seconds**: polling once a minute,
+every fourth or fifth request was refused, around the clock. Claude Code on the
+same account draws on the same allowance.
+
+So the app spends that allowance instead of running into it:
+
+* **Never faster than every 2 minutes**, whatever `refresh_seconds` says.
+* **Slower while nothing changes.** Each poll that finds the numbers where they
+  were waits half as long again, up to 5 minutes; the first change snaps back.
+* **Nothing while the screen is locked**, and one poll soon after you unlock.
+* **Learns from a 429.** Besides waiting it out (2 minutes, doubling up to 30), a
+  refused timed poll slows the pace itself by a quarter, up to 15 minutes. That
+  fades by a tenth every six hours without another 429. So if something else on
+  the account - Claude Code, a second PC - is using the allowance too, the app
+  settles at the pace that is left.
+* **Restarts cost nothing.** The pace, the backoff and the time of the last
+  request are kept in `.poll_state.json`; a restart with fresh cached numbers
+  waits until they are due instead of asking straight away.
+* **Refresh** skips the wait, but pressed twice within 15 seconds it asks once,
+  and a Refresh that hits the limit does not slow the pace.
+* **A 429 is not an error** while the numbers are under 15 minutes old: the flyout
+  just says when they are from. After that it says why they are not updating.
+
+A simulated day in `tests/test_notifications.py` - an endpoint modelled on the
+log, with Claude Code sharing it for eight working hours - goes from 1,154
+requests with 286 refused (polling every minute) to 374 requests with 2 refused,
+with the numbers never more than 5 minutes old.
+
 ## Notes
 
 * Only one instance runs. The lock is a per-session named mutex, and
@@ -437,10 +470,7 @@ success / caution / critical colours.
 * Network blips show `offline` without wiping the displayed numbers, and the last
   good figures are cached to `.usage_cache.json`, so a restart shows numbers
   immediately instead of an empty panel.
-* An HTTP 429 from the usage endpoint backs the poller off (2 minutes, doubling
-  up to 30) instead of retrying every minute; the overlay keeps showing the last
-  figures and the flyout says when the next attempt is. **Refresh** ignores the
-  backoff.
+* See *Rate limits* below for how the poller stays inside the endpoint's limit.
 * The icon re-registers itself if Explorer restarts; the overlay re-reads the
   taskbar's geometry twice a second, so it follows moves, resizes and DPI changes.
 * Notifications fire once per threshold per reset window — sitting at 100% does

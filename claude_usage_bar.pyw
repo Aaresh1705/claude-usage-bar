@@ -58,12 +58,13 @@ FALLBACK_LOG = os.path.join(os.environ.get("LOCALAPPDATA") or os.environ.get("TE
 ICON_CACHE = os.path.join(DATA_DIR, ".icons")
 USAGE_CACHE = os.path.join(DATA_DIR, ".usage_cache.json")
 NOTIFY_STATE = os.path.join(DATA_DIR, ".notify_state.json")
+POLL_STATE = os.path.join(DATA_DIR, ".poll_state.json")
 CRED_PATH = os.path.expanduser(os.path.join("~", ".claude", ".credentials.json"))
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 FONT_DIR = os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts")
 
 DEFAULT_CONFIG = {
-    "refresh_seconds": 60,
+    "refresh_seconds": 120,
     "primary_metric": "session",
     "secondary_metric": "weekly_all",
     "icon": {
@@ -250,6 +251,7 @@ class Usage(object):
     status = None
     stale = False
     with_events = False
+    manual = False          # asked for by the Refresh button, not the timer
 
     def age_seconds(self):
         """How old the numbers are, or None when there are none."""
@@ -528,6 +530,46 @@ def save_notify_state(path, state):
 
 
 EVENT_CHECK_SECONDS = 3600       # grants change rarely; the endpoint rate-limits hard
+
+# Pacing. The usage endpoint sustains about one request per 100 seconds - at
+# one a minute, every fourth or fifth came back 429 - and Claude Code on the
+# same account draws on the same allowance. So the app polls well inside it,
+# and slows itself down further whenever it is told no.
+POLL_MIN_SECONDS = 120     # never faster than this, whatever config.json says
+POLL_IDLE_SECONDS = 300    # numbers standing still: stretch out towards this
+POLL_MAX_SECONDS = 900     # the slowest that a run of 429s can make the pace
+MANUAL_GAP_SECONDS = 15    # Refresh pressed twice in a row asks once
+
+
+def load_poll_state(path):
+    """The pace learned from 429s and the last request, kept across restarts
+    so a restart neither forgets a rate limit nor spends a request on it."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        return {k: float(raw[k]) for k in ("pace", "pace_at", "last_request", "retry_at", "backoff")
+                if isinstance(raw.get(k), (int, float))}
+    except Exception:
+        return {}
+
+
+def save_poll_state(path, state):
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+    except Exception:
+        pass
+
+
+def shown_error(usage):
+    """The error worth showing. Being rate limited while the numbers are only
+    minutes old is the endpoint pacing us, not news - the panel already says
+    when the numbers are from."""
+    if usage.error and usage.status == 429 and usage.limits:
+        age = usage.age_seconds()
+        if age is not None and age < 900:
+            return None
+    return usage.error
 USAGE_PAGE = "https://claude.ai/settings/usage"
 
 
@@ -899,10 +941,16 @@ def render_cell(size, role, bar_index, bar_total, primary, secondary, cfg):
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+wtsapi32 = ctypes.WinDLL("wtsapi32", use_last_error=True)
+wtsapi32.WTSRegisterSessionNotification.argtypes = [wt.HWND, wt.DWORD]
+wtsapi32.WTSRegisterSessionNotification.restype = wt.BOOL
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 WM_DESTROY = 0x0002
 WM_COMMAND = 0x0111
+WM_WTSSESSION_CHANGE = 0x02B1
+WTS_SESSION_LOCK, WTS_SESSION_UNLOCK = 0x7, 0x8
+NOTIFY_FOR_THIS_SESSION = 0
 WM_APP = 0x8000
 WM_TRAY = WM_APP + 1
 WM_LBUTTONUP = 0x0202
@@ -1031,8 +1079,17 @@ class TrayApp(object):
         self._fetching = False
         self._pending = None
 
-        self.backoff = 0
-        self.retry_at = 0
+        self.poll_path = POLL_STATE
+        saved = load_poll_state(self.poll_path)
+        self.pace = saved.get("pace", 0.0)              # learned from 429s
+        self.pace_at = saved.get("pace_at", 0.0)
+        self.last_request = saved.get("last_request", 0.0)
+        self.backoff = saved.get("backoff", 0.0)
+        self.retry_at = saved.get("retry_at", 0.0)
+        self._unchanged = 0             # polls in a row that changed nothing
+        self._last_seen = None
+        self.locked = False
+        self.next_poll_at = self.first_poll_at()
         self._lock = threading.Lock()
 
         os.makedirs(ICON_CACHE, exist_ok=True)
@@ -1048,6 +1105,12 @@ class TrayApp(object):
         self.hwnd = user32.CreateWindowExW(0, "ClaudeUsageBarWnd", "Claude Usage Bar",
                                            0, 0, 0, 0, 0, None, None, self.hinst, None)
         self.wm_taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")
+        # Told when the session locks and unlocks: nobody reads a locked screen,
+        # so polling pauses until you are back.
+        try:
+            wtsapi32.WTSRegisterSessionNotification(self.hwnd, NOTIFY_FOR_THIS_SESSION)
+        except Exception:
+            log("no lock notifications: %s" % traceback.format_exc())
         self._add_icon()
         self.sync_widget()
 
@@ -1107,8 +1170,8 @@ class TrayApp(object):
 
     def _tooltip(self):
         u = self.usage
-        if u.error:
-            return "Claude usage: %s" % u.error
+        if shown_error(u):
+            return "Claude usage: %s" % shown_error(u)
         p_key = self.cfg["primary_metric"]
         s_key = self.cfg.get("secondary_metric") or p_key
         p, s = u.by_key(p_key), u.by_key(s_key)
@@ -1279,6 +1342,13 @@ class TrayApp(object):
             self.registered = 0
             self._add_icon()
             return 0
+        if msg == WM_WTSSESSION_CHANGE:
+            if wparam == WTS_SESSION_LOCK:
+                self.locked = True
+            elif wparam == WTS_SESSION_UNLOCK:
+                self.locked = False
+                self.on_unlock()
+            return 0
         if msg == WM_DESTROY:
             user32.PostQuitMessage(0)
             return 0
@@ -1307,38 +1377,113 @@ class TrayApp(object):
         log("event check failed (%s); next in %ds"
             % (result.error or "unreadable grants", self._event_backoff))
 
-    def _back_off(self):
-        self.backoff = min(max(self.backoff * 2, 120), 1800)
-        self.retry_at = time.time() + self.backoff
-        log("rate limited; next poll in %ds" % self.backoff)
+    def base_interval(self):
+        """The pace while the numbers are moving: config.json's refresh_seconds,
+        never under POLL_MIN_SECONDS, and slower after the endpoint has said
+        no. What a 429 taught fades by a tenth every six hours without another."""
+        try:
+            configured = float(self.cfg.get("refresh_seconds", POLL_MIN_SECONDS))
+        except (TypeError, ValueError):
+            configured = POLL_MIN_SECONDS
+        learned = 0.0
+        if self.pace:
+            hours = max(0.0, time.time() - self.pace_at) / 3600.0
+            learned = min(self.pace * 0.9 ** (hours / 6.0), POLL_MAX_SECONDS)
+        return max(configured, POLL_MIN_SECONDS, learned)
 
-    def note_rate_limit(self, result):
-        """429 means the endpoint wants us to slow down; polling it every minute
-        regardless just keeps it angry (and floods the log)."""
-        if getattr(result, "status", None) == 429:
-            self._back_off()
-        elif not result.error:
-            self.backoff = 0
-            self.retry_at = 0
+    def poll_interval(self):
+        """How long until the next timed poll. While the numbers stand still
+        each wait is half as long again, up to five minutes - so an idle
+        evening costs a fraction of the requests - and the first change snaps
+        back to the base pace."""
+        base = self.base_interval()
+        if self._unchanged <= 0:
+            return base
+        return max(base, min(base * 1.5 ** self._unchanged, POLL_IDLE_SECONDS))
 
-    def start_fetch(self, manual=False, events=None):
+    def first_poll_at(self):
+        """At startup, don't spend a request on numbers the cache already has:
+        a restart - or signing in after a reboot - waits until the cached
+        figures are due, and still honours a rate limit the last run was under."""
+        now = time.time()
+        age = self.usage.age_seconds() if self.usage.limits else None
+        if age is None:
+            # Nothing to show yet: ask now, just not on top of the last run's request.
+            return max(now, self.last_request + 60)
+        return max(now, now - age + self.base_interval(), self.retry_at,
+                   self.last_request + POLL_MIN_SECONDS)
+
+    def on_unlock(self):
+        """Back at the desk: fresh numbers soon, as far as the pace allows."""
+        now = time.time()
+        soon = max(now + 3, self.last_request + POLL_MIN_SECONDS, self.retry_at)
+        self.next_poll_at = min(self.next_poll_at, soon)
+
+    def maybe_poll(self):
+        """The poll timer ticks often and only acts when a poll is due - the
+        pace lives in next_poll_at, not in the timer."""
+        if self.locked or self._fetching or time.time() < self.next_poll_at:
+            return
+        self.start_fetch()
+
+    def start_fetch(self, manual=False):
+        """A timed poll, or the Refresh button (`manual`), which skips the wait
+        but asks only once when pressed twice in a row."""
         if self._fetching:
             return
-        if not manual and self.retry_at and time.time() < self.retry_at:
+        now = time.time()
+        if manual:
+            if now - self.last_request < MANUAL_GAP_SECONDS:
+                return
+        elif self.retry_at and now < self.retry_at:
             return
+        # Refresh re-checks events too, so a reset you have just used stops
+        # being advertised straight away.
+        self._fetch(self.events_enabled() and (manual or self.event_poll_due()), manual)
+
+    def _fetch(self, events, manual=False):
         self._fetching = True
-        if events is None:
-            # Refresh re-checks events too, so a reset you have just used
-            # stops being advertised straight away.
-            events = self.events_enabled() and (manual or self.event_poll_due())
+        self.last_request = time.time()
+        # provisional - replaced by plan_next_poll when the answer lands
+        self.next_poll_at = self.last_request + self.poll_interval()
 
         def worker():
             result = fetch_usage(events)
+            result.manual = manual
             self._fetching = False          # before the result is visible, so
             with self._lock:                # apply_pending can fetch again
                 self._pending = result
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def plan_next_poll(self, result):
+        """When to ask again, from what this answer said."""
+        now = time.time()
+        if getattr(result, "status", None) == 429:
+            if result.manual:
+                # Refresh pressed into a rate limit: wait as before, learn nothing.
+                self.retry_at = max(self.retry_at, now + max(self.backoff, POLL_MIN_SECONDS))
+            else:
+                # The pace was too quick for what is left of the allowance, so
+                # slow down for good - not just this once.
+                self.pace = min(self.base_interval() * 1.25, POLL_MAX_SECONDS)
+                self.pace_at = now
+                self.backoff = min(max(self.backoff * 2, POLL_MIN_SECONDS), 1800)
+                self.retry_at = now + self.backoff
+            self.next_poll_at = self.retry_at
+            log("rate limited%s; next poll in %ds, then every %ds"
+                % (" (Refresh)" if result.manual else "", self.retry_at - now, self.base_interval()))
+        else:
+            if not result.error:
+                self.backoff, self.retry_at = 0.0, 0.0
+                seen = tuple((l.get("label"), round(float(l.get("percent") or 0), 1))
+                             for l in result.limits)
+                self._unchanged = self._unchanged + 1 if seen == self._last_seen else 0
+                self._last_seen = seen
+            self.next_poll_at = now + self.poll_interval()
+        save_poll_state(self.poll_path, {
+            "pace": self.pace, "pace_at": self.pace_at, "last_request": self.last_request,
+            "retry_at": self.retry_at, "backoff": self.backoff})
 
     def apply_pending(self):
         if self._pending is None:        # cheap check on the hot pump path
@@ -1354,7 +1499,7 @@ class TrayApp(object):
                     # Refused as the event check: that says nothing about
                     # usage, so ask again the plain way rather than show - or
                     # announce - an error that may be the event check's alone.
-                    self.start_fetch(manual=True, events=False)
+                    self._fetch(False)
                     return
             else:
                 self._event_backoff = 0
@@ -1376,7 +1521,7 @@ class TrayApp(object):
         self.usage = result
         if not result.error:
             save_usage_cache(result)
-        self.note_rate_limit(result)
+        self.plan_next_poll(result)
         self.update_icon()
         self.check_notifications()
         if self.flyout is not None:
@@ -1898,10 +2043,10 @@ class Flyout(object):
         stamp = "Updated %s" % usage.updated.strftime("%H:%M") if usage.updated else "No data yet"
         label(header, stamp, size=12, color=colors["muted"], side="right")
 
-        if usage.error:
+        if shown_error(usage):
             note = tk.Frame(self.body, bg=colors["surface"])
             note.pack(fill="x", pady=(self.px(10), 0))
-            text = usage.error
+            text = shown_error(usage)
             if self.app.retry_at and time.time() < self.app.retry_at:
                 text += " · retrying in %s" % human_delta(
                     datetime.fromtimestamp(self.app.retry_at, timezone.utc))
@@ -2592,7 +2737,7 @@ class TaskbarWidget(object):
         # endpoint rate-limits often, and a figure from a minute ago is still
         # worth showing at full strength. The flyout explains the error.
         age = usage.age_seconds()
-        stale = age is None or age > max(300.0, 3.0 * float(self.app.cfg["refresh_seconds"]))
+        stale = age is None or age > max(600.0, 2.0 * self.app.poll_interval() + 60.0)
         event = bool(live_events(usage)) and bool(c.get("show_events", True))
         state = (round(pct, 1), human_delta(reset), error, stale, event, self.geometry,
                  windows_uses_light_theme())
@@ -2885,8 +3030,7 @@ def main():
         app.apply_pending()
 
     every("pump", 50, pump, first_ms=50)
-    every("poll", lambda: max(10, int(app.cfg["refresh_seconds"])) * 1000,
-          app.start_fetch, first_ms=100)
+    every("poll", 5000, app.maybe_poll, first_ms=500)
     every("config watch", 2000, lambda: app.reload_config() if app.config_changed_on_disk() else None)
     every("tray icons", 5000, app.ensure_icons)
     every("overlay", 500, lambda: app.widget.tick() if app.widget is not None else None,
