@@ -60,6 +60,7 @@ USAGE_CACHE = os.path.join(DATA_DIR, ".usage_cache.json")
 NOTIFY_STATE = os.path.join(DATA_DIR, ".notify_state.json")
 POLL_STATE = os.path.join(DATA_DIR, ".poll_state.json")
 CRED_PATH = os.path.expanduser(os.path.join("~", ".claude", ".credentials.json"))
+VERSION = "1.1.0"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 FONT_DIR = os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts")
 
@@ -310,7 +311,7 @@ def fetch_usage(with_events=False):
                 "Authorization": "Bearer " + token,
                 "anthropic-beta": "oauth-2025-04-20",
                 "Content-Type": "application/json",
-                "User-Agent": claude_code_user_agent() if with_events else "claude-usage-bar/1.0",
+                "User-Agent": claude_code_user_agent() if with_events else "claude-usage-bar/" + VERSION,
             },
             timeout=20,
         )
@@ -2989,7 +2990,7 @@ def single_instance():
 
 def main():
     global root
-    log("starting (pid %d, %s)" % (os.getpid(), sys.executable))
+    log("starting v%s (pid %d, %s)" % (VERSION, os.getpid(), sys.executable))
     if not single_instance():
         log("another instance is running; exiting")
         return
