@@ -9,6 +9,9 @@ limit, and any model-scoped weekly limit, straight from
 `https://api.anthropic.com/api/oauth/usage`, authenticated with the OAuth token
 already stored in `~/.claude/.credentials.json`. Nothing else leaves the machine.
 
+It can also show **Ollama** cloud usage - for running Claude Code on Ollama's cloud
+models - next to Claude's or instead of it (see *Providers*).
+
 It can draw itself in two places, independently:
 
 **Taskbar overlay** — a small always-visible readout in the taskbar's free left
@@ -124,6 +127,58 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall
 Stops it and removes the scheduled task (and the Startup shortcut, if you used
 one). `config.json` and the log stay.
 
+## Providers
+
+Right click the widget and tick **Show Claude usage** and/or **Show Ollama usage**
+(the last one ticked stays on). The choice is saved in `config.json` under
+`providers`. With one provider the widget looks as described above; with both it
+shows a row each, in the same width, told apart by a small mark (Claude's orange
+spark, Ollama's ring), and the flyout gets a section per provider.
+
+```
+taskbar:  [ * 35%  ▰▰▰▱▱  3h 50m ]
+          [ ◉ 12%  ▰▱▱▱▱  18d 4h ]
+```
+
+### Ollama
+
+For Claude Code running on Ollama (`ollama launch claude`, or `ANTHROPIC_BASE_URL`
+pointed at Ollama) with **cloud** models. Local models have no usage limit, so
+there is nothing to show for them.
+
+* **Sign-in:** nothing to set up if `ollama signin` has been run on that PC - the
+  app signs its request with the same key pair the `ollama` CLI uses
+  (`~/.ollama/id_ed25519`), exactly the way the CLI does. Alternatively create an
+  API key at <https://ollama.com/settings/keys> and put it in
+  `providers.ollama.api_key` (or the `OLLAMA_API_KEY` variable); a key wins over
+  the sign-in when both are there.
+* **What it shows:** the plan's **monthly credits**, as a percentage used - or, on
+  subscriptions from before 31 Aug 2026, the 5-hour and weekly limits. Plus
+  pay-as-you-go spend over the last four weeks when there is any.
+* **Reset date:** Ollama renews the credits on the monthly anniversary of the
+  subscription and does not report the date, so set `providers.ollama.reset_day`
+  to that day of the month (1-31) for a countdown; without it the flyout says it
+  renews on the billing day.
+* **Where the numbers come from:** `GET https://ollama.com/api/usage`, the
+  undocumented endpoint behind ollama.com's own usage page. It gives percentages
+  only - no dollar amounts, no reset times - so that is what the app shows.
+* **Pace:** every 5 minutes (15 while nothing changes), with the same backoff and
+  learning as for Claude - the budget is monthly, and the endpoint's own limits
+  are unknown.
+
+| Key | Meaning |
+| --- | --- |
+| `providers.claude.enabled` | Show Claude usage. Default `true`. |
+| `providers.ollama.enabled` | Show Ollama usage. Default `false`. |
+| `providers.ollama.api_key` | Optional API key; empty means use `ollama signin`. |
+| `providers.ollama.metric` | What the widget shows for Ollama: `monthly`, `session`, `weekly`, or `max` (the highest). Default `max`. |
+| `providers.ollama.reset_day` | Day of the month the credits renew, for the countdown. |
+| `providers.ollama.refresh_seconds` | Poll interval, at least 300. |
+
+Notifications work the same for both, named after the provider ("Ollama monthly
+limit reached"), and a limit of each that falls due on the same poll shares one
+toast.
+
 ## Configuration
 
 Everything lives in `config.json`. The file is watched: **save it and the icon
@@ -141,6 +196,7 @@ you can keep a minimal file with just your overrides.
 | `left_click` | `flyout`, `refresh`, or `web`. Applies to the tray icons and the overlay. |
 | `tray.enabled` | Draw the tray icons at all. Turn it off to run overlay-only. |
 | `usage_page_url` | Where "Open usage page" goes. |
+| `providers` | Which usage to show - see *Providers*. |
 | `check_events` | Look for promotional grants once an hour (see *Events*). `false` never sends the request that identifies as Claude Code. Default `true`. |
 | `tooltip_template` | See placeholders below. |
 
@@ -437,7 +493,7 @@ So the app spends that allowance instead of running into it:
   the account - Claude Code, a second PC - is using the allowance too, the app
   settles at the pace that is left.
 * **Restarts cost nothing.** The pace, the backoff and the time of the last
-  request are kept in `.poll_state.json`; a restart with fresh cached numbers
+  request are kept in `.poll_state.json` (`.poll_state.ollama.json` for Ollama); a restart with fresh cached numbers
   waits until they are due instead of asking straight away.
 * **Refresh** skips the wait, but pressed twice within 15 seconds it asks once,
   and a Refresh that hits the limit does not slow the pace.
@@ -454,7 +510,7 @@ with the numbers never more than 5 minutes old.
 * Only one instance runs. The lock is a per-session named mutex, and
   `ERROR_ALREADY_EXISTS` is only honoured when the other instance's window
   actually answers — a leftover lock can't stop the app from starting again.
-* Every launch writes a `starting v1.1.0 (pid …)` line to the log, so "it didn't come
+* Every launch writes a `starting v1.2.0 (pid …)` line to the log, so "it didn't come
   back after a reboot" is answerable. A line means it started - compare its
   timestamp with `(Get-CimInstance Win32_OperatingSystem).LastBootUpTime` to see
   how long the shell took to get to it. No line at all means Windows never

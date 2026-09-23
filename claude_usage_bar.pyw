@@ -7,11 +7,16 @@ Everything visual lives in config.json; edit it and pick "Reload config".
 Run with pythonw.exe (no console). Log: claude_usage_bar.log next to this file.
 """
 
+import base64
+import calendar
 import ctypes
 import ctypes.wintypes as wt
+import hashlib
 import json
+import math
 import os
 import re
+import struct
 import subprocess
 import sys
 import threading
@@ -60,8 +65,11 @@ USAGE_CACHE = os.path.join(DATA_DIR, ".usage_cache.json")
 NOTIFY_STATE = os.path.join(DATA_DIR, ".notify_state.json")
 POLL_STATE = os.path.join(DATA_DIR, ".poll_state.json")
 CRED_PATH = os.path.expanduser(os.path.join("~", ".claude", ".credentials.json"))
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+OLLAMA_URL = "https://ollama.com"
+OLLAMA_USAGE_PAGE = "https://ollama.com/settings/usage"
+OLLAMA_KEY_PATH = os.path.expanduser(os.path.join("~", ".ollama", "id_ed25519"))
 FONT_DIR = os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts")
 
 DEFAULT_CONFIG = {
@@ -136,6 +144,17 @@ DEFAULT_CONFIG = {
     },
     "left_click": "flyout",
     "usage_page_url": "https://claude.ai/settings/usage",
+    # Which usage to show. Switch them from the right-click menu, or here.
+    "providers": {
+        "claude": {"enabled": True},
+        "ollama": {
+            "enabled": False,
+            "api_key": "",          # optional; `ollama signin` is used when empty
+            "metric": "max",        # what the widget shows: monthly, session, weekly, max
+            "reset_day": None,      # day of the month the credits renew (1-31)
+            "refresh_seconds": 300,
+        },
+    },
 }
 
 
@@ -379,9 +398,9 @@ def fetch_usage(with_events=False):
     return u
 
 
-def save_usage_cache(usage):
+def save_usage_cache(usage, path=None):
     try:
-        with open(USAGE_CACHE, "w", encoding="utf-8") as fh:
+        with open(path or USAGE_CACHE, "w", encoding="utf-8") as fh:
             json.dump({"limits": usage.limits, "extra": usage.extra, "spend": usage.spend,
                        "breakdown": usage.breakdown, "buckets": usage.buckets,
                        "events": getattr(usage, "events", None),
@@ -391,12 +410,12 @@ def save_usage_cache(usage):
         pass
 
 
-def load_usage_cache():
+def load_usage_cache(path=None):
     """Show the last known numbers immediately at startup instead of a blank
     panel - a fresh poll can be a minute away, or rate limited."""
     u = Usage()
     try:
-        with open(USAGE_CACHE, "r", encoding="utf-8") as fh:
+        with open(path or USAGE_CACHE, "r", encoding="utf-8") as fh:
             blob = json.load(fh)
         u.limits = blob.get("limits") or []
         u.extra, u.spend = blob.get("extra"), blob.get("spend")
@@ -465,6 +484,225 @@ def breakdown_rows(data):
         out.append({"key": key, "display_name": str(row.get("display_name") or key or "?"),
                     "percent": pct})
     return out
+
+
+# Ollama ------------------------------------------------------------------------
+#
+# ollama.com reports cloud usage at GET /api/usage - undocumented; it is what
+# the ollama.com settings page reads. It answers either an API key (Bearer) or
+# a request signed the way the `ollama` CLI signs its own: the Ed25519 key pair
+# `ollama signin` links to the account, over "METHOD,/path?ts=<unix seconds>".
+# That signature is all this needs, so it is done here from RFC 8032 rather
+# than pulling in a crypto library for one operation.
+
+_ED_P = 2 ** 255 - 19
+_ED_L = 2 ** 252 + 27742317777372353535851937790883648493
+_ED_D = -121665 * pow(121666, _ED_P - 2, _ED_P) % _ED_P
+
+
+def _ed_add(a, b):
+    p = _ED_P
+    A = (a[1] - a[0]) * (b[1] - b[0]) % p
+    B = (a[1] + a[0]) * (b[1] + b[0]) % p
+    C = 2 * a[3] * b[3] * _ED_D % p
+    D = 2 * a[2] * b[2] % p
+    E, F, G, H = B - A, D - C, D + C, B + A
+    return (E * F % p, G * H % p, F * G % p, E * H % p)
+
+
+def _ed_mul(n, point):
+    acc = (0, 1, 1, 0)
+    while n > 0:
+        if n & 1:
+            acc = _ed_add(acc, point)
+        point = _ed_add(point, point)
+        n >>= 1
+    return acc
+
+
+def _ed_base():
+    p = _ED_P
+    y = 4 * pow(5, p - 2, p) % p
+    x2 = (y * y - 1) * pow(_ED_D * y * y + 1, p - 2, p) % p
+    x = pow(x2, (p + 3) // 8, p)
+    if (x * x - x2) % p:
+        x = x * pow(2, (p - 1) // 4, p) % p
+    if x & 1:
+        x = p - x
+    return (x, y, 1, x * y % p)
+
+
+_ED_B = _ed_base()
+
+
+def _ed_encode(point):
+    zi = pow(point[2], _ED_P - 2, _ED_P)
+    x, y = point[0] * zi % _ED_P, point[1] * zi % _ED_P
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def ed25519_sign(seed, message):
+    """An Ed25519 signature (RFC 8032, 5.1.6) with the 32-byte private seed."""
+    h = hashlib.sha512(seed).digest()
+    a = (int.from_bytes(h[:32], "little") & ((1 << 254) - 8)) | (1 << 254)
+    public = _ed_encode(_ed_mul(a, _ED_B))
+    r = int.from_bytes(hashlib.sha512(h[32:] + message).digest(), "little") % _ED_L
+    R = _ed_encode(_ed_mul(r, _ED_B))
+    k = int.from_bytes(hashlib.sha512(R + public + message).digest(), "little") % _ED_L
+    return R + ((r + k * a) % _ED_L).to_bytes(32, "little")
+
+
+def ed25519_public(seed):
+    h = hashlib.sha512(seed).digest()
+    a = (int.from_bytes(h[:32], "little") & ((1 << 254) - 8)) | (1 << 254)
+    return _ed_encode(_ed_mul(a, _ED_B))
+
+
+def _ssh_string(buf, i):
+    n = struct.unpack(">I", buf[i:i + 4])[0]
+    return buf[i + 4:i + 4 + n], i + 4 + n
+
+
+def read_openssh_ed25519(text):
+    """(seed, public key blob) from an unencrypted OpenSSH ed25519 private key -
+    the format `ollama` writes to ~/.ollama/id_ed25519."""
+    body = "".join(l for l in text.strip().splitlines() if not l.startswith("-----"))
+    raw = base64.b64decode(body)
+    magic = b"openssh-key-v1\x00"
+    if not raw.startswith(magic):
+        raise ValueError("not an OpenSSH private key")
+    cipher, i = _ssh_string(raw, len(magic))
+    _, i = _ssh_string(raw, i)                  # kdf name
+    _, i = _ssh_string(raw, i)                  # kdf options
+    if cipher != b"none":
+        raise ValueError("the key is passphrase protected")
+    count = struct.unpack(">I", raw[i:i + 4])[0]
+    public_blob, i = _ssh_string(raw, i + 4)
+    private, _ = _ssh_string(raw, i)
+    kind, j = _ssh_string(private, 8)           # after the two check ints
+    if count != 1 or kind != b"ssh-ed25519":
+        raise ValueError("not a single ed25519 key")
+    _, j = _ssh_string(private, j)              # public key again
+    secret, _ = _ssh_string(private, j)         # seed + public key
+    return secret[:32], public_blob
+
+
+def ollama_signature(key_text, method, uri):
+    """The Authorization value the ollama CLI would send for `uri` (which
+    carries its ?ts=), from the text of its private key file."""
+    seed, public_blob = read_openssh_ed25519(key_text)
+    signature = ed25519_sign(seed, ("%s,%s" % (method, uri)).encode())
+    return "%s:%s" % (base64.b64encode(public_blob).decode(),
+                      base64.b64encode(signature).decode())
+
+
+def next_monthly_reset(day, now=None):
+    """When Ollama's monthly credits next renew. They renew on the monthly
+    anniversary of the subscription, which the API does not report - so the
+    day comes from config.json (`reset_day`). None when it is not set."""
+    try:
+        day = int(day)
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= day <= 31:
+        return None
+    now = now or datetime.now().astimezone()
+
+    def on(year, month):
+        last = calendar.monthrange(year, month)[1]
+        return now.replace(year=year, month=month, day=min(day, last),
+                           hour=0, minute=0, second=0, microsecond=0)
+
+    moment = on(now.year, now.month)
+    if moment <= now:
+        moment = on(now.year + 1, 1) if now.month == 12 else on(now.year, now.month + 1)
+    return moment.isoformat()
+
+
+# The windows ollama.com reports: plans since 31 Aug 2026 have one monthly
+# credit budget; older Pro/Max subscriptions keep a 5-hour and a weekly one.
+_OLLAMA_WINDOWS = (("session", "Session (5h)"), ("weekly", "Weekly"),
+                   ("monthly", "Monthly credits"))
+
+
+def parse_ollama_usage(data, reset_day=None, now=None):
+    """(limits, spend) from /api/usage. `usage` there is a fraction of the
+    plan's allowance (0.053 = 5.3%); a window that is absent is not metered,
+    rather than shown as 0%. `spend` is the pay-as-you-go cost over the last
+    four weeks, when there is any."""
+    blob = data.get("limits") if isinstance(data, dict) else None
+    if not isinstance(blob, dict):
+        raise ValueError("no limits in the Ollama response")
+    known = dict(_OLLAMA_WINDOWS)
+    order = [k for k, _ in _OLLAMA_WINDOWS] + sorted(k for k in blob if k not in known)
+    limits = []
+    for key in order:
+        entry = blob.get(key)
+        if not isinstance(entry, dict):
+            continue
+        try:
+            fraction = float(entry.get("usage"))
+        except (TypeError, ValueError):
+            continue
+        limits.append({
+            "key": key,
+            "label": known.get(key) or key.replace("_", " ").capitalize(),
+            "percent": max(0.0, fraction * 100.0),
+            "resets_at": next_monthly_reset(reset_day, now) if key == "monthly" else None,
+            "severity": "normal",
+            "group": key,
+        })
+    spend = None
+    activity = data.get("activity")
+    if isinstance(activity, dict):
+        try:
+            cost = float(activity.get("cost"))
+            if cost > 0:
+                spend = {"cost": cost}
+        except (TypeError, ValueError):
+            pass
+    return limits, spend
+
+
+def fetch_ollama_usage(settings):
+    """One poll of ollama.com. An API key in config.json (or OLLAMA_API_KEY)
+    wins; otherwise the request is signed with the `ollama signin` key."""
+    u = Usage()
+    api_key = str(settings.get("api_key") or os.environ.get("OLLAMA_API_KEY") or "").strip()
+    path = "/api/usage"
+    try:
+        headers = {"Accept": "application/json", "User-Agent": "claude-usage-bar/" + VERSION}
+        if api_key:
+            uri = path
+            headers["Authorization"] = "Bearer " + api_key
+        else:
+            with open(OLLAMA_KEY_PATH, "r", encoding="ascii") as fh:
+                key_text = fh.read()
+            uri = "%s?ts=%d" % (path, int(time.time()))
+            headers["Authorization"] = ollama_signature(key_text, "GET", uri)
+        resp = requests.get(OLLAMA_URL + uri, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            u.status = resp.status_code
+            if resp.status_code in (401, 403):
+                u.error = ("Ollama API key refused" if api_key
+                           else "Signed out - run ollama signin")
+            else:
+                u.error = {429: "Rate limited by ollama.com",
+                           500: "ollama.com is having trouble",
+                           503: "ollama.com is having trouble",
+                           }.get(resp.status_code, "Ollama error (HTTP %s)" % resp.status_code)
+            log("ollama usage http %s" % resp.status_code)
+            return u
+        u.limits, u.spend = parse_ollama_usage(resp.json(), settings.get("reset_day"))
+        u.updated = datetime.now()
+    except FileNotFoundError:
+        u.error = "Not signed in to Ollama"
+    except requests.RequestException:
+        u.error = "Offline"
+    except Exception:
+        u.error = "Something went wrong"
+        log("ollama fetch failed: %s" % traceback.format_exc())
+    return u
 
 
 def window_key(resets_at):
@@ -1030,6 +1268,8 @@ def guid_for(index):
 
 
 CMD_DETAILS, CMD_REFRESH, CMD_CONFIG, CMD_RELOAD, CMD_WEB, CMD_STARTUP, CMD_LOG, CMD_QUIT = range(1, 9)
+CMD_PROVIDER = 20                       # + index into SOURCES
+MF_GRAYED = 0x0001
 
 
 def startup_lnk_path():
@@ -1057,30 +1297,38 @@ def toggle_startup():
     return os.path.exists(lnk)
 
 
-class TrayApp(object):
-    def __init__(self):
-        self.cfg = load_config()
-        self.use_guid = bool(self.cfg["icon"].get("use_guid", True))
-        self.cfg_mtime = os.path.getmtime(CONFIG_PATH) if os.path.exists(CONFIG_PATH) else 0
-        self.usage = load_usage_cache() or Usage()
+# ---------------------------------------------------------------------------
+# Providers
+# ---------------------------------------------------------------------------
+
+def source_path(base, key):
+    """Each provider keeps its own cache and poll state. Claude keeps the
+    original file names, so upgrading loses nothing."""
+    if key == "claude":
+        return base
+    stem, ext = os.path.splitext(base)
+    return "%s.%s%s" % (stem, key, ext)
+
+
+class Source(object):
+    """One provider: its latest numbers, and when and how to ask for more.
+
+    The widget, the flyout and the notifications only read `usage`. Pacing is
+    per provider, because each has its own endpoint and its own rate limit."""
+
+    key = name = ""
+    poll_min = POLL_MIN_SECONDS
+    poll_idle = POLL_IDLE_SECONDS
+    poll_max = POLL_MAX_SECONDS
+    missing_error = None     # no credentials at all: the old numbers go too
+
+    def __init__(self, app):
+        self.app = app
+        self.cache_path = source_path(USAGE_CACHE, self.key)
+        self.poll_path = source_path(POLL_STATE, self.key)
+        self.usage = load_usage_cache(self.cache_path) or Usage()
         if not self.usage.limits:
             self.usage.error = "Loading…"
-        self.hicons = []
-        self.registered = 0
-        self.use_guid = bool(self.cfg["icon"].get("use_guid", True))
-        self.icon_slot = 0
-        self.state_path = NOTIFY_STATE
-        self.last_notified = load_notify_state(self.state_path)
-        self._signed_out_since = None
-        self.events_retry_at = 0.0       # a failed event check waits its turn
-        self._event_backoff = 0
-        self.flyout = None
-        self.widget = None
-        self.toast = None
-        self._fetching = False
-        self._pending = None
-
-        self.poll_path = POLL_STATE
         saved = load_poll_state(self.poll_path)
         self.pace = saved.get("pace", 0.0)              # learned from 429s
         self.pace_at = saved.get("pace_at", 0.0)
@@ -1089,9 +1337,358 @@ class TrayApp(object):
         self.retry_at = saved.get("retry_at", 0.0)
         self._unchanged = 0             # polls in a row that changed nothing
         self._last_seen = None
-        self.locked = False
-        self.next_poll_at = self.first_poll_at()
+        self._fetching = False
+        self._pending = None
         self._lock = threading.Lock()
+        self.signed_out_since = None
+        self.next_poll_at = self.first_poll_at()
+
+    @property
+    def cfg(self):
+        return self.app.cfg
+
+    def settings(self):
+        """This provider's block under "providers" in config.json."""
+        return (self.cfg.get("providers") or {}).get(self.key) or {}
+
+    # -- what each provider says for itself --------------------------------
+    def fetch(self, events):
+        raise NotImplementedError
+
+    def configured_interval(self):
+        return self.settings().get("refresh_seconds", self.poll_min)
+
+    def usage_page(self):
+        return self.settings().get("usage_page_url") or ""
+
+    def metric(self):
+        """Which limit the widget shows."""
+        return self.settings().get("metric") or "max"
+
+    def wants_events(self, manual):
+        return False
+
+    def accept(self, result):
+        """False to drop a result (after arranging a retry)."""
+        return True
+
+    def merge(self, result):
+        """Carry over whatever a result does not repeat."""
+
+    def watched(self, n):
+        """(identity, limit) for every limit to notify about."""
+        return [("%s:%s" % (self.key, limit_identity(l)), l) for l in self.usage.limits]
+
+    def limit_name(self, lim):
+        """A limit's name in a notification, where no heading says whose it is."""
+        return "%s %s" % (self.name, lim["label"].lower())
+
+    def signed_out_body(self, error):
+        """What to say when `error` means the sign-in is the problem, else None."""
+        return None
+
+    def reset_hint(self, lim):
+        """What to say under a limit that reports no reset time."""
+        return None
+
+    def notes(self):
+        """Extra lines for the bottom of this provider's section."""
+        return []
+
+    # -- pacing --------------------------------------------------------------
+    def base_interval(self):
+        """The pace while the numbers are moving: the configured interval,
+        never under poll_min, and slower after the endpoint has said no. What
+        a 429 taught fades by a tenth every six hours without another."""
+        try:
+            configured = float(self.configured_interval())
+        except (TypeError, ValueError):
+            configured = self.poll_min
+        learned = 0.0
+        if self.pace:
+            hours = max(0.0, time.time() - self.pace_at) / 3600.0
+            learned = min(self.pace * 0.9 ** (hours / 6.0), self.poll_max)
+        return max(configured, self.poll_min, learned)
+
+    def poll_interval(self):
+        """How long until the next timed poll. While the numbers stand still
+        each wait is half as long again, up to poll_idle - so an idle evening
+        costs a fraction of the requests - and the first change snaps back."""
+        base = self.base_interval()
+        if self._unchanged <= 0:
+            return base
+        return max(base, min(base * 1.5 ** self._unchanged, self.poll_idle))
+
+    def first_poll_at(self):
+        """At startup, don't spend a request on numbers the cache already has:
+        a restart - or signing in after a reboot - waits until the cached
+        figures are due, and still honours a rate limit the last run was under."""
+        now = time.time()
+        age = self.usage.age_seconds() if self.usage.limits else None
+        if age is None:
+            # Nothing to show yet: ask now, just not on top of the last run's request.
+            return max(now, self.last_request + 60)
+        return max(now, now - age + self.base_interval(), self.retry_at,
+                   self.last_request + self.poll_min)
+
+    def on_unlock(self):
+        """Back at the desk: fresh numbers soon, as far as the pace allows."""
+        now = time.time()
+        soon = max(now + 3, self.last_request + self.poll_min, self.retry_at)
+        self.next_poll_at = min(self.next_poll_at, soon)
+
+    def maybe_poll(self):
+        if self._fetching or time.time() < self.next_poll_at:
+            return
+        self.start_fetch()
+
+    def start_fetch(self, manual=False):
+        """A timed poll, or the Refresh button (`manual`), which skips the wait
+        but asks only once when pressed twice in a row."""
+        if self._fetching:
+            return
+        now = time.time()
+        if manual:
+            if now - self.last_request < MANUAL_GAP_SECONDS:
+                return
+        elif self.retry_at and now < self.retry_at:
+            return
+        self._fetch(self.wants_events(manual), manual)
+
+    def _fetch(self, events, manual=False):
+        self._fetching = True
+        self.last_request = time.time()
+        # provisional - replaced by plan_next_poll when the answer lands
+        self.next_poll_at = self.last_request + self.poll_interval()
+
+        def worker():
+            result = self.fetch(events)
+            result.manual = manual
+            self._fetching = False          # before the result is visible, so
+            with self._lock:                # apply_pending can fetch again
+                self._pending = result
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def plan_next_poll(self, result):
+        """When to ask again, from what this answer said."""
+        now = time.time()
+        if getattr(result, "status", None) == 429:
+            if result.manual:
+                # Refresh pressed into a rate limit: wait as before, learn nothing.
+                self.retry_at = max(self.retry_at, now + max(self.backoff, self.poll_min))
+            else:
+                # The pace was too quick for what is left of the allowance, so
+                # slow down for good - not just this once.
+                self.pace = min(self.base_interval() * 1.25, self.poll_max)
+                self.pace_at = now
+                self.backoff = min(max(self.backoff * 2, self.poll_min), 1800)
+                self.retry_at = now + self.backoff
+            self.next_poll_at = self.retry_at
+            log("%s: rate limited%s; next poll in %ds, then every %ds"
+                % (self.name, " (Refresh)" if result.manual else "", self.retry_at - now,
+                   self.base_interval()))
+        else:
+            if not result.error:
+                self.backoff, self.retry_at = 0.0, 0.0
+                seen = tuple((l.get("label"), round(float(l.get("percent") or 0), 1))
+                             for l in result.limits)
+                self._unchanged = self._unchanged + 1 if seen == self._last_seen else 0
+                self._last_seen = seen
+            self.next_poll_at = now + self.poll_interval()
+        save_poll_state(self.poll_path, {
+            "pace": self.pace, "pace_at": self.pace_at, "last_request": self.last_request,
+            "retry_at": self.retry_at, "backoff": self.backoff})
+
+    def apply_pending(self):
+        """Take in a finished poll; True when `usage` changed."""
+        if self._pending is None:        # cheap check on the hot pump path
+            return False
+        with self._lock:
+            result, self._pending = self._pending, None
+        if result is None or not self.accept(result):
+            return False
+        if result.error and result.error != self.missing_error and self.usage.limits:
+            result.limits = self.usage.limits  # keep last good numbers on a blip
+            result.spend, result.extra = self.usage.spend, self.usage.extra
+            result.breakdown, result.buckets = self.usage.breakdown, self.usage.buckets
+            result.updated = self.usage.updated
+        self.merge(result)
+        self.usage = result
+        if not result.error:
+            save_usage_cache(result, self.cache_path)
+        self.plan_next_poll(result)
+        return True
+
+
+class ClaudeSource(Source):
+    """Claude Pro/Max limits from the endpoint Claude Code's /usage reads,
+    with the OAuth token Claude Code keeps - plus promotional events."""
+
+    key, name = "claude", "Claude"
+    missing_error = "Not signed in to Claude Code"
+
+    def __init__(self, app):
+        self.events_retry_at = 0.0       # a failed event check waits its turn
+        self._event_backoff = 0
+        Source.__init__(self, app)
+
+    def fetch(self, events):
+        return fetch_usage(events)
+
+    def configured_interval(self):
+        return self.cfg.get("refresh_seconds", POLL_MIN_SECONDS)
+
+    def usage_page(self):
+        return self.cfg.get("usage_page_url") or "https://claude.ai/settings/usage"
+
+    def metric(self):
+        return ((self.cfg.get("taskbar_widget") or {}).get("metric")
+                or self.cfg.get("primary_metric") or "session")
+
+    def events_enabled(self):
+        return bool(self.cfg.get("check_events", True))
+
+    def wants_events(self, manual):
+        # Refresh re-checks events too, so a reset you have just used stops
+        # being advertised straight away.
+        return self.events_enabled() and (manual or self.event_poll_due())
+
+    def event_poll_due(self):
+        """One poll an hour doubles as the event check, so looking for grants
+        never costs a request of its own. A failed event check backs off on its
+        own clock, and the polls in between go out as plain usage requests - so
+        a problem with the event check can never freeze the numbers."""
+        if not self.events_enabled():
+            return False
+        now = time.time()
+        if now < self.events_retry_at:
+            return False
+        age = now - float(self.usage.events_checked or 0)
+        return self.usage.events is None or age >= EVENT_CHECK_SECONDS
+
+    def _event_check_failed(self, result):
+        self._event_backoff = min(max(self._event_backoff * 2, 300), EVENT_CHECK_SECONDS)
+        self.events_retry_at = time.time() + self._event_backoff
+        log("event check failed (%s); next in %ds"
+            % (result.error or "unreadable grants", self._event_backoff))
+
+    def accept(self, result):
+        if result.with_events:
+            if result.error or result.events is None:
+                self._event_check_failed(result)
+                if result.status not in (None, 429):
+                    # Refused as the event check: that says nothing about
+                    # usage, so ask again the plain way rather than show - or
+                    # announce - an error that may be the event check's alone.
+                    self._fetch(False)
+                    return False
+            else:
+                self._event_backoff = 0
+        return True
+
+    def merge(self, result):
+        fresh_events = result.with_events and not result.error and result.events is not None
+        if fresh_events:
+            if result.spend is None:          # the event poll skips `spend`
+                result.spend = self.usage.spend
+            before = [e["id"] for e in (self.usage.events or [])]
+            if [e["id"] for e in result.events] != before:
+                log("events: %s" % (", ".join(e["label"] for e in result.events) or "none"))
+        elif self.events_enabled():
+            result.events = self.usage.events
+            result.events_checked = self.usage.events_checked
+
+    def watched(self, n):
+        return watched_limits(self.usage, n.get("metrics") or [n.get("metric", "session")])
+
+    def limit_name(self, lim):
+        return lim["label"]
+
+    def signed_out_body(self, error):
+        if error == self.missing_error:
+            return "Claude Code is not signed in on this PC. Run claude and log in."
+        if error.startswith("Signed out"):
+            return "Claude Code's sign-in has expired. Run any claude command to refresh it."
+        return None
+
+    def notes(self):
+        extra = self.usage.extra or {}
+        if extra.get("is_enabled"):
+            return ["Extra usage: %d%% of the monthly limit"
+                    % round(float(extra.get("utilization") or 0))]
+        return []
+
+
+class OllamaSource(Source):
+    """Ollama cloud usage from ollama.com, signed with the `ollama signin` key
+    (or an API key). Asked for gently: the budget is monthly and moves slowly,
+    and the endpoint's own limits are unknown."""
+
+    key, name = "ollama", "Ollama"
+    poll_min, poll_idle, poll_max = 300, 900, 1800
+    missing_error = "Not signed in to Ollama"
+
+    def fetch(self, events):
+        return fetch_ollama_usage(self.settings())
+
+    def usage_page(self):
+        return self.settings().get("usage_page_url") or OLLAMA_USAGE_PAGE
+
+    def limit_name(self, lim):
+        short = {"session": "session", "weekly": "weekly", "monthly": "monthly"}
+        return "Ollama %s" % short.get(lim.get("key"), lim["label"].lower())
+
+    def signed_out_body(self, error):
+        if error == self.missing_error:
+            return ("Ollama is not signed in on this PC. Run ollama signin, "
+                    "or put an API key in config.json.")
+        if error.startswith("Signed out") or "API key refused" in error:
+            return ("ollama.com refused the sign-in. Run ollama signin again, "
+                    "or check the API key in config.json.")
+        return None
+
+    def reset_hint(self, lim):
+        return {"session": "Resets every 5 hours",
+                "weekly": "Resets every 7 days",
+                "monthly": "Renews on your billing day each month - set reset_day "
+                           "in config.json to count down to it",
+                }.get(lim.get("key"))
+
+    def notes(self):
+        spend = self.usage.spend or {}
+        if spend.get("cost"):
+            return ["Pay-as-you-go: $%.2f over the last 4 weeks" % float(spend["cost"])]
+        return []
+
+
+SOURCES = (ClaudeSource, OllamaSource)       # also the order they are shown in
+
+
+def enabled_providers(cfg):
+    """Keys of the providers switched on, in display order - never none."""
+    chosen = cfg.get("providers") or {}
+    keys = [cls.key for cls in SOURCES if bool((chosen.get(cls.key) or {}).get("enabled"))]
+    return keys or [SOURCES[0].key]
+
+
+class TrayApp(object):
+    def __init__(self):
+        self.cfg = load_config()
+        self.use_guid = bool(self.cfg["icon"].get("use_guid", True))
+        self.cfg_mtime = os.path.getmtime(CONFIG_PATH) if os.path.exists(CONFIG_PATH) else 0
+        self.hicons = []
+        self.registered = 0
+        self.use_guid = bool(self.cfg["icon"].get("use_guid", True))
+        self.icon_slot = 0
+        self.state_path = NOTIFY_STATE
+        self.last_notified = load_notify_state(self.state_path)
+        self.flyout = None
+        self.widget = None
+        self.toast = None
+        self.locked = False
+        self.sources = {}                # key -> Source, for the enabled ones
+        self.sync_sources()
 
         os.makedirs(ICON_CACHE, exist_ok=True)
         self.icon_size = user32.GetSystemMetrics(SM_CXSMICON) or 16
@@ -1136,9 +1733,13 @@ class TrayApp(object):
 
     def _make_hicons(self):
         """Render every tray icon for the current usage state."""
-        primary = self.usage.percent(self.cfg["primary_metric"])
-        sec_key = self.cfg.get("secondary_metric")
-        secondary = self.usage.percent(sec_key) if sec_key else None
+        first = self.active()[0]
+        if first.key == "claude":
+            primary = self.usage.percent(self.cfg["primary_metric"])
+            sec_key = self.cfg.get("secondary_metric")
+            secondary = self.usage.percent(sec_key) if sec_key else None
+        else:
+            primary, secondary = self.usage.percent(first.metric()), None
         size = max(16, self.icon_size)
         roles = self._roles()
         n = len(roles)
@@ -1170,7 +1771,19 @@ class TrayApp(object):
         return self.hicons
 
     def _tooltip(self):
-        u = self.usage
+        """The template for Claude, then a line for each other provider."""
+        lines = [self._claude_tooltip()] if "claude" in self.sources else []
+        for src in self.active():
+            if src.key == "claude":
+                continue
+            error = shown_error(src.usage)
+            lim = src.usage.by_key(src.metric())
+            lines.append("%s: %s" % (src.name, error) if error or not lim else
+                         "%s \u00b7 %s: %d%%" % (src.name, lim["label"], round(lim["percent"])))
+        return "\n".join(lines)[:127]
+
+    def _claude_tooltip(self):
+        u = self.sources["claude"].usage
         if shown_error(u):
             return "Claude usage: %s" % shown_error(u)
         p_key = self.cfg["primary_metric"]
@@ -1189,10 +1802,9 @@ class TrayApp(object):
             "updated": u.updated.strftime("%H:%M") if u.updated else "-",
         }
         try:
-            text = self.cfg["tooltip_template"].format(**values)
+            return self.cfg["tooltip_template"].format(**values)
         except Exception:
-            text = "Claude %s%%" % values["primary"]
-        return text[:127]
+            return "Claude %s%%" % values["primary"]
 
     def tray_enabled(self):
         return bool((self.cfg.get("tray") or {}).get("enabled", True))
@@ -1235,7 +1847,7 @@ class TrayApp(object):
 
     def update_icon(self):
         if self.widget is not None:
-            self.widget.refresh(self.usage)
+            self.widget.refresh(self.active())
         if not self.tray_enabled():
             return
         if self.registered != self._segment_count():
@@ -1283,6 +1895,13 @@ class TrayApp(object):
         user32.AppendMenuW(menu, MF_STRING, CMD_DETAILS, "Show details")
         user32.AppendMenuW(menu, MF_STRING, CMD_REFRESH, "Refresh now")
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+        on = enabled_providers(self.cfg)
+        for i, cls in enumerate(SOURCES):
+            flags = MF_STRING | (MF_CHECKED if cls.key in on else 0)
+            if on == [cls.key]:
+                flags |= MF_GRAYED               # the last one stays on
+            user32.AppendMenuW(menu, flags, CMD_PROVIDER + i, "Show %s usage" % cls.name)
+        user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(menu, MF_STRING, CMD_CONFIG, "Edit config...")
         user32.AppendMenuW(menu, MF_STRING, CMD_RELOAD, "Reload config")
         user32.AppendMenuW(menu, MF_STRING, CMD_WEB, "Open usage page")
@@ -1312,7 +1931,10 @@ class TrayApp(object):
         elif cmd == CMD_RELOAD:
             self.reload_config()
         elif cmd == CMD_WEB:
-            webbrowser.open(self.cfg.get("usage_page_url"))
+            webbrowser.open(self.usage_page())
+        elif CMD_PROVIDER <= cmd < CMD_PROVIDER + len(SOURCES):
+            key = SOURCES[cmd - CMD_PROVIDER].key
+            self.set_provider(key, key not in enabled_providers(self.cfg))
         elif cmd == CMD_LOG:
             if os.path.exists(LOG_PATH):
                 os.startfile(LOG_PATH)
@@ -1332,7 +1954,7 @@ class TrayApp(object):
                 elif action == "refresh":
                     self.start_fetch(manual=True)
                 elif action == "web":
-                    webbrowser.open(self.cfg.get("usage_page_url"))
+                    webbrowser.open(self.usage_page())
             elif event in (WM_RBUTTONUP, WM_CONTEXTMENU):
                 self.show_menu()
             return 0
@@ -1355,178 +1977,83 @@ class TrayApp(object):
             return 0
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
-    # -- data --------------------------------------------------------------
-    def events_enabled(self):
-        return bool(self.cfg.get("check_events", True))
+    # -- providers ---------------------------------------------------------
+    def sync_sources(self):
+        """Start or stop providers to match the config."""
+        want = enabled_providers(self.cfg)
+        for cls in SOURCES:
+            if cls.key in want and cls.key not in self.sources:
+                self.sources[cls.key] = cls(self)
+                log("%s usage on" % cls.name)
+            elif cls.key not in want and cls.key in self.sources:
+                del self.sources[cls.key]
+                log("%s usage off" % cls.name)
 
-    def event_poll_due(self):
-        """One poll an hour doubles as the event check, so looking for grants
-        never costs a request of its own. A failed event check backs off on its
-        own clock, and the polls in between go out as plain usage requests - so
-        a problem with the event check can never freeze the numbers."""
-        if not self.events_enabled():
-            return False
-        now = time.time()
-        if now < self.events_retry_at:
-            return False
-        age = now - float(self.usage.events_checked or 0)
-        return self.usage.events is None or age >= EVENT_CHECK_SECONDS
+    def active(self):
+        """The enabled providers, in display order."""
+        return [self.sources[cls.key] for cls in SOURCES if cls.key in self.sources]
 
-    def _event_check_failed(self, result):
-        self._event_backoff = min(max(self._event_backoff * 2, 300), EVENT_CHECK_SECONDS)
-        self.events_retry_at = time.time() + self._event_backoff
-        log("event check failed (%s); next in %ds"
-            % (result.error or "unreadable grants", self._event_backoff))
+    @property
+    def usage(self):
+        """The first provider's numbers - what the tray icon draws."""
+        return self.active()[0].usage
 
-    def base_interval(self):
-        """The pace while the numbers are moving: config.json's refresh_seconds,
-        never under POLL_MIN_SECONDS, and slower after the endpoint has said
-        no. What a 429 taught fades by a tenth every six hours without another."""
-        try:
-            configured = float(self.cfg.get("refresh_seconds", POLL_MIN_SECONDS))
-        except (TypeError, ValueError):
-            configured = POLL_MIN_SECONDS
-        learned = 0.0
-        if self.pace:
-            hours = max(0.0, time.time() - self.pace_at) / 3600.0
-            learned = min(self.pace * 0.9 ** (hours / 6.0), POLL_MAX_SECONDS)
-        return max(configured, POLL_MIN_SECONDS, learned)
+    def usage_page(self):
+        return self.active()[0].usage_page()
 
-    def poll_interval(self):
-        """How long until the next timed poll. While the numbers stand still
-        each wait is half as long again, up to five minutes - so an idle
-        evening costs a fraction of the requests - and the first change snaps
-        back to the base pace."""
-        base = self.base_interval()
-        if self._unchanged <= 0:
-            return base
-        return max(base, min(base * 1.5 ** self._unchanged, POLL_IDLE_SECONDS))
-
-    def first_poll_at(self):
-        """At startup, don't spend a request on numbers the cache already has:
-        a restart - or signing in after a reboot - waits until the cached
-        figures are due, and still honours a rate limit the last run was under."""
-        now = time.time()
-        age = self.usage.age_seconds() if self.usage.limits else None
-        if age is None:
-            # Nothing to show yet: ask now, just not on top of the last run's request.
-            return max(now, self.last_request + 60)
-        return max(now, now - age + self.base_interval(), self.retry_at,
-                   self.last_request + POLL_MIN_SECONDS)
-
-    def on_unlock(self):
-        """Back at the desk: fresh numbers soon, as far as the pace allows."""
-        now = time.time()
-        soon = max(now + 3, self.last_request + POLL_MIN_SECONDS, self.retry_at)
-        self.next_poll_at = min(self.next_poll_at, soon)
-
-    def maybe_poll(self):
-        """The poll timer ticks often and only acts when a poll is due - the
-        pace lives in next_poll_at, not in the timer."""
-        if self.locked or self._fetching or time.time() < self.next_poll_at:
+    def set_provider(self, key, on):
+        """Switch a provider on or off in config.json, keeping at least one."""
+        want = enabled_providers(self.cfg)
+        if not on and want == [key]:
             return
-        self.start_fetch()
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except Exception:
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        providers = raw.get("providers") if isinstance(raw.get("providers"), dict) else {}
+        entry = providers.get(key) if isinstance(providers.get(key), dict) else {}
+        entry["enabled"] = bool(on)
+        providers[key] = entry
+        raw["providers"] = providers
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
+                json.dump(raw, fh, indent=2)
+        except Exception:
+            log("could not save config: %s" % traceback.format_exc())
+            return
+        self.reload_config()
+
+    # -- data --------------------------------------------------------------
+    def maybe_poll(self):
+        """Ticks often; each provider decides whether a poll of its own is due.
+        Nobody reads a locked screen, so nothing is polled while it is locked."""
+        if self.locked:
+            return
+        for src in self.active():
+            src.maybe_poll()
 
     def start_fetch(self, manual=False):
-        """A timed poll, or the Refresh button (`manual`), which skips the wait
-        but asks only once when pressed twice in a row."""
-        if self._fetching:
-            return
-        now = time.time()
-        if manual:
-            if now - self.last_request < MANUAL_GAP_SECONDS:
-                return
-        elif self.retry_at and now < self.retry_at:
-            return
-        # Refresh re-checks events too, so a reset you have just used stops
-        # being advertised straight away.
-        self._fetch(self.events_enabled() and (manual or self.event_poll_due()), manual)
+        for src in self.active():
+            src.start_fetch(manual)
 
-    def _fetch(self, events, manual=False):
-        self._fetching = True
-        self.last_request = time.time()
-        # provisional - replaced by plan_next_poll when the answer lands
-        self.next_poll_at = self.last_request + self.poll_interval()
-
-        def worker():
-            result = fetch_usage(events)
-            result.manual = manual
-            self._fetching = False          # before the result is visible, so
-            with self._lock:                # apply_pending can fetch again
-                self._pending = result
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def plan_next_poll(self, result):
-        """When to ask again, from what this answer said."""
-        now = time.time()
-        if getattr(result, "status", None) == 429:
-            if result.manual:
-                # Refresh pressed into a rate limit: wait as before, learn nothing.
-                self.retry_at = max(self.retry_at, now + max(self.backoff, POLL_MIN_SECONDS))
-            else:
-                # The pace was too quick for what is left of the allowance, so
-                # slow down for good - not just this once.
-                self.pace = min(self.base_interval() * 1.25, POLL_MAX_SECONDS)
-                self.pace_at = now
-                self.backoff = min(max(self.backoff * 2, POLL_MIN_SECONDS), 1800)
-                self.retry_at = now + self.backoff
-            self.next_poll_at = self.retry_at
-            log("rate limited%s; next poll in %ds, then every %ds"
-                % (" (Refresh)" if result.manual else "", self.retry_at - now, self.base_interval()))
-        else:
-            if not result.error:
-                self.backoff, self.retry_at = 0.0, 0.0
-                seen = tuple((l.get("label"), round(float(l.get("percent") or 0), 1))
-                             for l in result.limits)
-                self._unchanged = self._unchanged + 1 if seen == self._last_seen else 0
-                self._last_seen = seen
-            self.next_poll_at = now + self.poll_interval()
-        save_poll_state(self.poll_path, {
-            "pace": self.pace, "pace_at": self.pace_at, "last_request": self.last_request,
-            "retry_at": self.retry_at, "backoff": self.backoff})
+    def on_unlock(self):
+        for src in self.active():
+            src.on_unlock()
 
     def apply_pending(self):
-        if self._pending is None:        # cheap check on the hot pump path
+        changed = False
+        for src in self.active():
+            if src._pending is not None and src.apply_pending():
+                changed = True
+        if not changed:
             return
-        with self._lock:
-            result, self._pending = self._pending, None
-        if result is None:
-            return
-        if result.with_events:
-            if result.error or result.events is None:
-                self._event_check_failed(result)
-                if result.status not in (None, 429):
-                    # Refused as the event check: that says nothing about
-                    # usage, so ask again the plain way rather than show - or
-                    # announce - an error that may be the event check's alone.
-                    self._fetch(False)
-                    return
-            else:
-                self._event_backoff = 0
-        if result.error and result.error != "Not signed in to Claude Code" and self.usage.limits:
-            result.limits = self.usage.limits  # keep last good numbers on a blip
-            result.spend, result.extra = self.usage.spend, self.usage.extra
-            result.breakdown, result.buckets = self.usage.breakdown, self.usage.buckets
-            result.updated = self.usage.updated
-        fresh_events = result.with_events and not result.error and result.events is not None
-        if fresh_events:
-            if result.spend is None:          # the event poll skips `spend`
-                result.spend = self.usage.spend
-            before = [e["id"] for e in (self.usage.events or [])]
-            if [e["id"] for e in result.events] != before:
-                log("events: %s" % (", ".join(e["label"] for e in result.events) or "none"))
-        elif self.events_enabled():
-            result.events = self.usage.events
-            result.events_checked = self.usage.events_checked
-        self.usage = result
-        if not result.error:
-            save_usage_cache(result)
-        self.plan_next_poll(result)
         self.update_icon()
         self.check_notifications()
         if self.flyout is not None:
-            self.flyout.refresh(self.usage)
+            self.flyout.refresh(self.active())
 
     def check_notifications(self):
         """Announce each threshold once per limit window - never twice for the
@@ -1539,19 +2066,19 @@ class TrayApp(object):
             return
         before = dict(self.last_notified)
         due = []
-        signed_out = self._check_signed_out(n)
-        if signed_out:
-            due.append(signed_out)
-        if not self.usage.error:
-            metrics = n.get("metrics") or [n.get("metric", "session")]
-            # Reaching a limit is always worth saying, whatever the list omits.
-            thresholds = sorted(set(float(t) for t in (n.get("at") or [])) | {100.0})
-            for identity, lim in watched_limits(self.usage, metrics):
-                alert = self._notify_limit(identity, lim, thresholds)
-                if alert:
-                    due.append(alert)
-        if n.get("events", True):
-            due.extend(self._grant_alerts())
+        # Reaching a limit is always worth saying, whatever the list omits.
+        thresholds = sorted(set(float(t) for t in (n.get("at") or [])) | {100.0})
+        for src in self.active():
+            signed_out = self._check_signed_out(n, src)
+            if signed_out:
+                due.append(signed_out)
+            if not src.usage.error:
+                for identity, lim in src.watched(n):
+                    alert = self._notify_limit(identity, lim, thresholds, src)
+                    if alert:
+                        due.append(alert)
+            if n.get("events", True):
+                due.extend(self._grant_alerts(src))
         if due:
             if len(due) == 1:
                 title, body = due[0][2], due[0][3]
@@ -1567,37 +2094,35 @@ class TrayApp(object):
         if self.last_notified != before:
             save_notify_state(self.state_path, self.last_notified)
 
-    def _check_signed_out(self, n):
+    def _check_signed_out(self, n, src):
         """Numbers that silently stop updating are worse than a nudge. Once
         sign-in has been failing for a quarter of an hour, say so - once per
         outage. Only a successful poll ends an outage: going offline in the
         middle of one does not start the count again."""
-        error = str(self.usage.error or "")
+        error = str(src.usage.error or "")
+        key = "__signed_out__" if src.key == "claude" else "__signed_out__:" + src.key
         if not error:
-            self._signed_out_since = None
-            self.last_notified.pop("__signed_out__", None)
+            src.signed_out_since = None
+            self.last_notified.pop(key, None)
             return None
-        missing = error == "Not signed in to Claude Code"
-        if not (missing or error.startswith("Signed out")):
+        body = src.signed_out_body(error)
+        if body is None:
             return None
-        if self._signed_out_since is None:
-            self._signed_out_since = time.time()
-        if "__signed_out__" in self.last_notified:
+        if src.signed_out_since is None:
+            src.signed_out_since = time.time()
+        if key in self.last_notified:
             return None
-        if time.time() - self._signed_out_since < float(n.get("signed_out_after", 900)):
+        if time.time() - src.signed_out_since < float(n.get("signed_out_after", 900)):
             return None
-        title = "Claude usage is not updating"
-        body = ("Claude Code is not signed in on this PC. Run claude and log in."
-                if missing else
-                "Claude Code's sign-in has expired. Run any claude command to refresh it.")
-        return "__signed_out__", ("", 1), title, body, title
+        title = "%s usage is not updating" % src.name
+        return key, ("", 1), title, body, title
 
-    def _grant_alerts(self):
+    def _grant_alerts(self, src):
         """One alert per grant, ever, on the first poll that can show it - held
         back while you are busy, it is simply due again next poll. A grant that
         cannot be used yet waits until it can."""
         out = []
-        for event in live_events(self.usage):
+        for event in live_events(src.usage):
             key = "grant:" + event["id"]
             if key in self.last_notified or event.get("usable_now") is False:
                 continue
@@ -1615,7 +2140,7 @@ class TrayApp(object):
             out.append((key, (event.get("ends_at") or "", 1), title, body, line))
         return out
 
-    def _notify_limit(self, key, lim, thresholds):
+    def _notify_limit(self, key, lim, thresholds, src):
         """Returns (key, record, title, body, line) when an alert is due."""
         pct = float(lim["percent"])
         window = window_key(lim.get("resets_at"))
@@ -1639,13 +2164,14 @@ class TrayApp(object):
             local = reset.astimezone()
             fmt = "%H:%M" if (reset - datetime.now(timezone.utc)).total_seconds() < 86400 else "%a %H:%M"
             when = "resets %s (in %s)" % (local.strftime(fmt), human_delta(reset))
+        name = src.limit_name(lim)
         if level >= 100:
-            title = "%s limit reached" % lim["label"]
+            title = "%s limit reached" % name
             # not .capitalize(): it lowercases the rest, turning "Sat" into "sat"
             body = (when[:1].upper() + when[1:]) if when else "No reset time reported."
         else:
-            title = "Claude usage %d%%" % round(pct)
-            body = "%s at %d%%%s" % (lim["label"], round(pct), (" - " + when) if when else "")
+            title = "%s usage %d%%" % (src.name, round(pct))
+            body = "%s at %d%%%s" % (name, round(pct), (" - " + when) if when else "")
         # and a one-line form, for when several alerts share a toast
         line = ("%s - %s" % (title, when) if level >= 100 and when
                 else title if level >= 100 else body)
@@ -1660,6 +2186,7 @@ class TrayApp(object):
             self.flyout = None
         if not self.tray_enabled():
             self.remove_icon()
+        self.sync_sources()
         self.sync_widget()
         self.update_icon()
 
@@ -1700,7 +2227,7 @@ class TrayApp(object):
             return
         if self.flyout is None:
             self.flyout = Flyout(self)
-        self.flyout.show(self.usage)
+        self.flyout.show(self.active())
 
     def quit(self):
         if self.widget is not None:
@@ -1997,29 +2524,32 @@ class Flyout(object):
             child.destroy()
         self._images = []
 
-    def refresh(self, usage):
+    def refresh(self, sources):
         """Only rebuild when something actually changed: a full rebuild drops
         button hover states and flashes the panel."""
         if not self.visible:
             return
-        if self.content_key(usage) == getattr(self, "_content_key", None):
+        if self.content_key(sources) == getattr(self, "_content_key", None):
             return
-        self.render(usage)
+        self.render(sources)
         self.win.update_idletasks()
         self.win.geometry("%dx%d" % (self.win.winfo_reqwidth(), self.win.winfo_reqheight()))
 
     @staticmethod
-    def content_key(usage):
+    def content_key(sources):
         """Everything the panel shows, so refresh() rebuilds only on a change."""
-        return (usage.error, usage.updated,
-                tuple((l["label"], round(l["percent"], 2), l["resets_at"]) for l in usage.limits),
-                tuple((b["key"], b["percent"]) for b in (usage.buckets or [])),
-                tuple((r.get("key"), r.get("percent")) for r in (usage.breakdown or [])),
-                tuple((e["id"], e.get("resets_left"), e.get("usable_now"))
-                      for e in live_events(usage)))
+        return tuple((src.key, usage.error, usage.updated,
+                      tuple((l["label"], round(l["percent"], 2), l["resets_at"])
+                            for l in usage.limits),
+                      tuple((b["key"], b["percent"]) for b in (usage.buckets or [])),
+                      tuple((r.get("key"), r.get("percent")) for r in (usage.breakdown or [])),
+                      tuple((e["id"], e.get("resets_left"), e.get("usable_now"))
+                            for e in live_events(usage)),
+                      tuple(src.notes()))
+                     for src, usage in ((src, src.usage) for src in sources))
 
-    def render(self, usage):
-        self._content_key = self.content_key(usage)
+    def render(self, sources):
+        self._content_key = self.content_key(sources)
         colors = self.theme()
         cfg = self.app.cfg["flyout"] or {}
         self._clear()
@@ -2038,22 +2568,60 @@ class Flyout(object):
             widget.pack(**pack)
             return widget
 
+        several = len(sources) > 1
         header = tk.Frame(self.body, bg=colors["surface"])
         header.pack(fill="x")
-        label(header, "Claude usage", size=16, weight="bold", side="left")
-        stamp = "Updated %s" % usage.updated.strftime("%H:%M") if usage.updated else "No data yet"
+        label(header, "Usage" if several else "%s usage" % sources[0].name,
+              size=16, weight="bold", side="left")
+        times = [src.usage.updated for src in sources if src.usage.updated]
+        stamp = "Updated %s" % max(times).strftime("%H:%M") if times else "No data yet"
         label(header, stamp, size=12, color=colors["muted"], side="right")
 
-        if shown_error(usage):
+        for i, src in enumerate(sources):
+            if several:
+                self._section_heading(src, colors, label, first=(i == 0))
+            self._render_source(src, colors, content, label)
+
+        divider = tk.Frame(self.body, bg=colors["divider"], height=1)
+        divider.pack(fill="x", pady=(self.px(16), 0))
+
+        footer = tk.Frame(self.body, bg=colors["surface"])
+        footer.pack(fill="x", pady=(self.px(12), 0))
+        self._button(footer, "Refresh", lambda: self.app.start_fetch(manual=True),
+                     colors, accent=True).pack(side="left")
+        if not several:                  # with several, each heading links its own
+            self._button(footer, "Usage page",
+                         lambda: webbrowser.open(sources[0].usage_page()),
+                         colors).pack(side="left", padx=(self.px(8), 0))
+        self._button(footer, "Settings", lambda: os.startfile(CONFIG_PATH),
+                     colors).pack(side="left", padx=(self.px(8), 0))
+
+    def _section_heading(self, src, colors, label, first):
+        """With more than one provider, each gets a heading that opens its own
+        usage page."""
+        if not first:
+            tk.Frame(self.body, bg=colors["divider"], height=1).pack(
+                fill="x", pady=(self.px(16), 0))
+        row = tk.Frame(self.body, bg=colors["surface"])
+        row.pack(fill="x", pady=(self.px(12 if first else 14), 0))
+        label(row, src.name, size=14, weight="bold", side="left")
+        link = label(row, "Usage page \u2197", size=12, color=self.accent(), side="right")
+        link.configure(cursor="hand2")
+        link.bind("<Button-1>", lambda e, url=src.usage_page(): webbrowser.open(url))
+
+    def _render_source(self, src, colors, content, label):
+        usage = src.usage
+        light = colors is FLUENT["light"]
+        error = shown_error(usage)
+        if error:
             note = tk.Frame(self.body, bg=colors["surface"])
             note.pack(fill="x", pady=(self.px(10), 0))
-            text = shown_error(usage)
-            if self.app.retry_at and time.time() < self.app.retry_at:
+            text = error
+            if src.retry_at and time.time() < src.retry_at:
                 text += " · retrying in %s" % human_delta(
-                    datetime.fromtimestamp(self.app.retry_at, timezone.utc))
+                    datetime.fromtimestamp(src.retry_at, timezone.utc))
             label(note, text, size=12, color=colors["caution"], anchor="w", fill="x")
 
-        light = colors is FLUENT["light"]
         for event in live_events(usage):
             self._event_card(event, colors, content)
 
@@ -2071,11 +2639,15 @@ class Flyout(object):
             bar.pack(fill="x", pady=(self.px(6), 0))
 
             reset = parse_reset(lim["resets_at"])
+            hint = None
             if reset:
-                label(self.body,
-                      "Resets %s · in %s" % (reset.strftime("%a %H:%M"), human_delta(reset)),
-                      size=12, color=colors["muted"], anchor="w", fill="x",
-                      pady=(self.px(4), 0))
+                fmt = "%a %d %b" if (reset - datetime.now(timezone.utc)).days >= 7 else "%a %H:%M"
+                hint = "Resets %s · in %s" % (reset.strftime(fmt), human_delta(reset))
+            else:
+                hint = src.reset_hint(lim)
+            if hint:
+                label(self.body, hint, size=12, color=colors["muted"], anchor="w", fill="x",
+                      pady=(self.px(4), 0)).configure(wraplength=content)
 
         # Where this week's usage went, as one stacked bar and a legend.
         shares = [(r.get("display_name") or r.get("key") or "?", float(r.get("percent") or 0))
@@ -2134,30 +2706,14 @@ class Flyout(object):
                 label(self.body, "   ".join(bits), size=12, color=colors["muted"],
                       anchor="w", fill="x", pady=(self.px(4), 0))
 
-        extra = usage.extra or {}
-        if extra.get("is_enabled"):
-            label(self.body, "Extra usage: %d%% of the monthly limit"
-                  % round(float(extra.get("utilization") or 0)),
-                  size=12, color=colors["muted"], anchor="w", fill="x",
+        for line in src.notes():
+            label(self.body, line, size=12, color=colors["muted"], anchor="w", fill="x",
                   pady=(self.px(12), 0))
 
-        divider = tk.Frame(self.body, bg=colors["divider"], height=1)
-        divider.pack(fill="x", pady=(self.px(16), 0))
-
-        footer = tk.Frame(self.body, bg=colors["surface"])
-        footer.pack(fill="x", pady=(self.px(12), 0))
-        self._button(footer, "Refresh", lambda: self.app.start_fetch(manual=True),
-                     colors, accent=True).pack(side="left")
-        self._button(footer, "Usage page",
-                     lambda: webbrowser.open(self.app.cfg.get("usage_page_url")),
-                     colors).pack(side="left", padx=(self.px(8), 0))
-        self._button(footer, "Settings", lambda: os.startfile(CONFIG_PATH),
-                     colors).pack(side="left", padx=(self.px(8), 0))
-
-    def show(self, usage):
+    def show(self, sources):
         cfg = self.app.cfg["flyout"] or {}
         self.scale = ui_scale()
-        self.render(usage)
+        self.render(sources)
         self.win.update_idletasks()
         w = self.win.winfo_reqwidth()
         h = self.win.winfo_reqheight()
@@ -2545,7 +3101,7 @@ class TaskbarWidget(object):
         elif action == "refresh":
             self.app.start_fetch(manual=True)
         elif action == "web":
-            webbrowser.open(self.app.cfg.get("usage_page_url"))
+            webbrowser.open(self.app.usage_page())
 
     def cfg(self):
         return self.app.cfg.get("taskbar_widget") or {}
@@ -2702,7 +3258,7 @@ class TaskbarWidget(object):
         if user32.GetWindow(self.hwnd, GW_HWNDPREV):
             user32.SetWindowPos(self.hwnd, wt.HWND(HWND_TOP), 0, 0, 0, 0,
                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
-        self.refresh(self.app.usage)
+        self.refresh(self.app.active())
         if not user32.IsWindowVisible(self.hwnd):
             user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
 
@@ -2721,38 +3277,144 @@ class TaskbarWidget(object):
         track = (0, 0, 0, 60) if light else (255, 255, 255, 70)
         return fg, muted, track
 
-    def refresh(self, usage):
+    def refresh(self, sources):
         if self.geometry is None:
             return
         c = self.cfg()
-        key = c.get("metric") or self.app.cfg["primary_metric"]
-        limit = usage.by_key(key)
-        pct = float(limit["percent"]) if limit else 0.0
-        reset = parse_reset(limit["resets_at"]) if limit else None
-        # Keep showing the last known figures; the flyout explains the trouble.
-        # A metric the API never returns would otherwise read as a confident 0%.
-        error = None if limit else (short_error(usage.error) or "no data")
-        # Numbers that stopped being refreshed still deserve to be trusted less:
-        # dim them rather than pretend they are live.
-        # Dimming is about age, not about whether the last poll failed: the
-        # endpoint rate-limits often, and a figure from a minute ago is still
-        # worth showing at full strength. The flyout explains the error.
-        age = usage.age_seconds()
-        stale = age is None or age > max(600.0, 2.0 * self.app.poll_interval() + 60.0)
-        event = bool(live_events(usage)) and bool(c.get("show_events", True))
-        state = (round(pct, 1), human_delta(reset), error, stale, event, self.geometry,
-                 windows_uses_light_theme())
+        rows = []
+        for src in sources:
+            usage = src.usage
+            limit = usage.by_key(src.metric())
+            pct = float(limit["percent"]) if limit else 0.0
+            reset = parse_reset(limit["resets_at"]) if limit else None
+            # Keep showing the last known figures; the flyout explains the
+            # trouble. A metric the API never returns would otherwise read as a
+            # confident 0%.
+            error = None if limit else (short_error(usage.error) or "no data")
+            # Numbers that stopped being refreshed deserve to be trusted less:
+            # dim them rather than pretend they are live. Dimming is about age,
+            # not about whether the last poll failed - a figure from a minute
+            # ago is still worth showing at full strength.
+            age = usage.age_seconds()
+            stale = age is None or age > max(600.0, 2.0 * src.poll_interval() + 60.0)
+            rows.append((src.key, pct, reset, error, stale))
+        event = (any(live_events(src.usage) for src in sources)
+                 and bool(c.get("show_events", True)))
+        state = (tuple((k, round(pct, 1), human_delta(r), e, st) for k, pct, r, e, st in rows),
+                 event, self.geometry, windows_uses_light_theme())
         if state == self._last_key:
             return
         _, _, w, h = self.geometry
-        image = self._render(w, h, pct, reset, error)
-        if event:
-            draw_sparkle(image, w, h, hex_to_rgba(c.get("event_color", "#F59E0B")))
-        if stale:
-            image = fade_image(image, float(c.get("stale_opacity", 0.55)))
+        sparkle = hex_to_rgba(c.get("event_color", "#F59E0B"))
+        if len(rows) == 1:
+            _, pct, reset, error, stale = rows[0]
+            image = self._render(w, h, pct, reset, error)
+            if event:
+                draw_sparkle(image, w, h, sparkle)
+            if stale:
+                image = fade_image(image, float(c.get("stale_opacity", 0.55)))
+        else:
+            image = self._render_rows(w, h, rows, event)
+            if event:
+                draw_sparkle(image, w, h, sparkle)
         self._image = image
         if self._blit(image):
             self._last_key = state
+
+    # How each provider's row is told apart when there are several.
+    MARKS = {"claude": ("spark", "#D97757"), "ollama": ("ring", None)}
+
+    def _render_rows(self, w, h, rows, event):
+        """Several providers at once: a row each, in the width one takes -
+        mark, percentage, bar, time to reset."""
+        c = self.cfg()
+        fg, muted, track = self._colors()
+        ss = max(1, int(c.get("supersample", 3)))
+        W, H = w * ss, h * ss
+        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        backdrop = c.get("background", "transparent")
+        if backdrop and backdrop != "transparent":
+            ImageDraw.Draw(img).rounded_rectangle(
+                (0, 0, W - 1, H - 1), radius=float(c.get("corner_radius", 6)) * ss,
+                fill=hex_to_rgba(backdrop, int(c.get("background_alpha", 255))))
+
+        def font(px, bold=True):
+            name = c.get("bold_font_file" if bold else "font_file",
+                         "segoeuib.ttf" if bold else "segoeui.ttf")
+            return load_font({"font_file": name}, px)
+
+        rh = H // len(rows)
+        m = rh * 0.62                          # the mark
+        gap = rh * 0.28
+        num, small = font(rh * 0.78), font(rh * 0.62, False)
+        probe = ImageDraw.Draw(img)
+        skull = rh * 0.80 * 0.9
+
+        # Columns shared by every row - mark, percentage, bar, time to reset -
+        # so the bars line up, and are drawn in every row or in none.
+        pct_w = reset_w = 0.0
+        for _, pct, reset, error, _ in rows:
+            if error:
+                continue
+            pct = max(0.0, min(100.0, pct))
+            pct_w = max(pct_w, skull if pct >= 99.5 else probe.textlength("%d%%" % round(pct), font=num))
+            if bool(c.get("show_reset", True)) and reset is not None:
+                reset_w = max(reset_w, probe.textlength(human_delta(reset), font=small))
+        # The sparkle sits in the top-right corner; the time column stays clear of it.
+        right = W - ((max(7, int(h * 0.30)) + 2) * ss if event else 0)
+        bar_x0 = m + gap + pct_w + gap
+        bar_x1 = right - (reset_w + gap if reset_w else 0)
+        show_bar = bool(c.get("show_bar", True)) and bar_x1 - bar_x0 > rh * 0.6
+        bar_h = max(2 * ss, int(rh * 0.24))
+
+        for i, (key, pct, reset, error, stale) in enumerate(rows):
+            row = Image.new("RGBA", (W, rh), (0, 0, 0, 0))
+            d = ImageDraw.Draw(row)
+            self._draw_mark(d, key, (0, (rh - m) / 2, m, (rh + m) / 2), fg)
+            x = m + gap
+            if error:
+                d.text((x, rh / 2), error, font=small, fill=hex_to_rgba(muted), anchor="lm")
+            else:
+                pct = max(0.0, min(100.0, pct))
+                color = color_for(pct, self.app.cfg["thresholds"])
+                if pct >= 99.5:
+                    size = rh * 0.80
+                    draw_skull(row, (x, (rh - size) / 2, x + skull, (rh + size) / 2),
+                               hex_to_rgba(fg), False)
+                else:
+                    d.text((x, rh / 2), "%d%%" % round(pct), font=num,
+                           fill=hex_to_rgba(color), anchor="lm")
+                if reset_w and reset is not None:
+                    d.text((right, rh / 2), human_delta(reset), font=small,
+                           fill=hex_to_rgba(muted), anchor="rm")
+                if show_bar:
+                    y0 = rh / 2 - bar_h / 2
+                    d.rounded_rectangle((bar_x0, y0, bar_x1, y0 + bar_h), radius=bar_h / 2,
+                                        fill=track)
+                    span = (bar_x1 - bar_x0) * pct / 100.0
+                    if span > 0:
+                        d.rounded_rectangle((bar_x0, y0, bar_x0 + max(span, bar_h), y0 + bar_h),
+                                            radius=bar_h / 2, fill=hex_to_rgba(color))
+            if stale:
+                row = fade_image(row, float(c.get("stale_opacity", 0.55)))
+            img.alpha_composite(row, (0, i * rh + (H - rh * len(rows)) // 2))
+        return self._finish(img, w, h)
+
+    def _draw_mark(self, d, key, box, fg):
+        """Claude's spark, Ollama's ring - enough to tell two rows apart."""
+        shape, color = self.MARKS.get(key, ("ring", None))
+        color = hex_to_rgba(color or fg)
+        x0, y0, x1, y1 = box
+        cx, cy, r = (x0 + x1) / 2.0, (y0 + y1) / 2.0, (x1 - x0) / 2.0
+        if shape == "spark":
+            width = max(1, int(r * 0.36))
+            for angle in (0, 45, 90, 135):
+                dx, dy = math.cos(math.radians(angle)) * r, math.sin(math.radians(angle)) * r
+                d.line((cx - dx, cy - dy, cx + dx, cy + dy), fill=color, width=width)
+        else:
+            d.ellipse((x0, y0, x1, y1), outline=color, width=max(1, int(r * 0.30)))
+            inner = r * 0.36
+            d.ellipse((cx - inner, cy - inner, cx + inner, cy + inner), fill=color)
 
     def _render(self, w, h, pct, reset, error):
         c = self.cfg()

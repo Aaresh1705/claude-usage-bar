@@ -7,11 +7,13 @@ instant comes back with different microseconds on every request, e.g.
 "2026-09-23T12:10:00.165535+00:00" then "2026-09-23T12:10:00.134418+00:00".
 """
 
+import base64
 import copy
 import importlib.util
 import itertools
 import json
 import os
+import struct
 import sys
 import tempfile
 import threading
@@ -50,26 +52,65 @@ def stamp(base):
     return "%s.%06d+00:00" % (base, next(_micro) % 1000000)
 
 
+def use_state_dir(state_dir):
+    """Point the app's per-provider files (cache, poll state) at `state_dir`."""
+    for name in ("USAGE_CACHE", "POLL_STATE"):
+        setattr(app, name, os.path.join(state_dir, os.path.basename(getattr(app, name))))
+
+
 class Harness(object):
-    """TrayApp's notification methods with nothing else attached."""
+    """TrayApp's polling and notification logic, with real provider sources
+    and no windows attached."""
 
     check_notifications = app.TrayApp.check_notifications
     _notify_limit = app.TrayApp._notify_limit
     _check_signed_out = app.TrayApp._check_signed_out
     _grant_alerts = app.TrayApp._grant_alerts
-    events_enabled = app.TrayApp.events_enabled
+    maybe_poll = app.TrayApp.maybe_poll
+    apply_pending = app.TrayApp.apply_pending
+    active = app.TrayApp.active
+    sync_sources = app.TrayApp.sync_sources
+    set_provider = app.TrayApp.set_provider
 
-    def __init__(self, state_dir=None, metrics=("session",), at=(80, 95, 100), busy=False):
+    def __init__(self, state_dir=None, metrics=("session",), at=(80, 95, 100), busy=False,
+                 providers=("claude",)):
+        state_dir = state_dir or tempfile.mkdtemp()
+        use_state_dir(state_dir)
         self.cfg = {"notifications": {"enabled": True, "at": list(at), "metrics": list(metrics)},
-                    "refresh_seconds": 60}
-        self.usage = app.Usage()
+                    "refresh_seconds": 60,
+                    "providers": dict((k, {"enabled": True}) for k in providers)}
         self.sent = []
         self.busy = busy
-        self.state_path = os.path.join(state_dir or tempfile.mkdtemp(), ".notify_state.json")
+        self.state_path = os.path.join(state_dir, ".notify_state.json")
         self.last_notified = app.load_notify_state(self.state_path)
-        self._signed_out_since = None
-        self.events_retry_at = 0.0
-        self._event_backoff = 0
+        self.locked, self.flyout = False, None
+        self.sources = {}
+        self.sync_sources()
+        for src in self.sources.values():
+            src.usage.error = None          # not "Loading…": tests start from a clean slate
+
+    @property
+    def claude(self):
+        return self.sources["claude"]
+
+    @property
+    def ollama(self):
+        return self.sources["ollama"]
+
+    @property
+    def usage(self):
+        return self.claude.usage
+
+    @usage.setter
+    def usage(self, value):
+        self.claude.usage = value
+
+    def update_icon(self):
+        pass
+
+    def reload_config(self):
+        self.cfg = app.load_config()
+        self.sync_sources()
 
     def notify(self, title, body):
         if self.busy:
@@ -422,41 +463,43 @@ def test_parsing():
                 os.environ[k] = v
 
 
-class Poller(Harness):
-    """The poll loop and apply_pending, with the network and the UI stubbed out."""
+def _forward(name):
+    """A Poller attribute that is really the Claude source's."""
+    return property(lambda self: getattr(self.claude, name),
+                    lambda self, value: setattr(self.claude, name, value))
 
-    apply_pending = app.TrayApp.apply_pending
-    event_poll_due = app.TrayApp.event_poll_due
-    _event_check_failed = app.TrayApp._event_check_failed
-    plan_next_poll = app.TrayApp.plan_next_poll
-    base_interval = app.TrayApp.base_interval
-    poll_interval = app.TrayApp.poll_interval
-    first_poll_at = app.TrayApp.first_poll_at
-    on_unlock = app.TrayApp.on_unlock
-    maybe_poll = app.TrayApp.maybe_poll
-    start_fetch = app.TrayApp.start_fetch
+
+class Poller(Harness):
+    """The Claude source's poll loop inside the app, with the network stubbed:
+    every request it would make is recorded in `fetches` as (events, manual)."""
+
+    pace, pace_at, last_request = _forward("pace"), _forward("pace_at"), _forward("last_request")
+    backoff, retry_at, next_poll_at = _forward("backoff"), _forward("retry_at"), _forward("next_poll_at")
+    events_retry_at, _event_backoff = _forward("events_retry_at"), _forward("_event_backoff")
+    signed_out_since, _pending = _forward("signed_out_since"), _forward("_pending")
 
     def __init__(self, state_dir=None):
         Harness.__init__(self, state_dir)
-        self.cfg["refresh_seconds"] = 60             # what existing config.json files say
-        self._lock = threading.Lock()
-        self._pending = None
-        self._fetching = False
-        self.flyout = None
-        self.poll_path = os.path.join(os.path.dirname(self.state_path), ".poll_state.json")
-        saved = app.load_poll_state(self.poll_path)
-        self.pace, self.pace_at = saved.get("pace", 0.0), saved.get("pace_at", 0.0)
-        self.last_request = saved.get("last_request", 0.0)
-        self.backoff, self.retry_at = saved.get("backoff", 0.0), saved.get("retry_at", 0.0)
-        self._unchanged, self._last_seen, self.locked = 0, None, False
-        self.next_poll_at = 0.0
         self.fetches = []
+        self.claude._fetch = lambda events, manual=False: self.fetches.append((events, manual))
 
-    def update_icon(self):
-        pass
+    def event_poll_due(self):
+        return self.claude.event_poll_due()
 
-    def _fetch(self, events, manual=False):
-        self.fetches.append((events, manual))
+    def base_interval(self):
+        return self.claude.base_interval()
+
+    def poll_interval(self):
+        return self.claude.poll_interval()
+
+    def first_poll_at(self):
+        return self.claude.first_poll_at()
+
+    def on_unlock(self):
+        return self.claude.on_unlock()
+
+    def start_fetch(self, manual=False):
+        return self.claude.start_fetch(manual)
 
     def deliver(self, with_events, error=None, status=None, events=(), spend="S", pct=20.0,
                 manual=False):
@@ -471,7 +514,7 @@ class Poller(Harness):
             if with_events and events is not None:
                 r.events = list(events)
                 r.events_checked = time.time()
-        self._pending = r
+        self.claude._pending = r
         self.apply_pending()
 
 
@@ -508,7 +551,7 @@ def test_event_poll():
     p.deliver(False, pct=33.0)
     p.cfg["notifications"]["signed_out_after"] = 0
     p.deliver(True, error=SIGNED_OUT, status=403)
-    check("is not shown as signed out", p.usage.error is None and p._signed_out_since is None
+    check("is not shown as signed out", p.usage.error is None and p.signed_out_since is None
           and p.sent == [], repr(p.usage.error))
     check("the numbers are asked for again right away, the plain way",
           p.fetches == [(False, False)], repr(p.fetches))
@@ -528,7 +571,9 @@ def test_event_poll():
     print("choosing the kind of request")
 
     class Fetcher(Poller):
-        _fetch = app.TrayApp._fetch
+        def __init__(self):
+            Poller.__init__(self)
+            del self.claude._fetch               # the real one, with the fake network
 
     asked = []
 
@@ -742,7 +787,8 @@ def test_a_day():
             r.error, r.status = RL, 429
         sim._pending = r
 
-    sim._fetch = fake_fetch
+    sim.claude._fetch = fake_fetch
+    sim.next_poll_at = sim.last_request = 0.0          # the fake clock starts at 0
     real_time = app.time
     app.time = types.SimpleNamespace(time=lambda: clock[0])
     try:
@@ -759,6 +805,7 @@ def test_a_day():
     print("    old: %d requests, %d refused" % (old_requests, old_refused))
     print("    new: %d requests, %d refused, longest wait for fresh numbers %ds"
           % (sim.requests, sim.refused, max(gaps or [0])))
+    check("the simulation really polled all day", sim.requests > 200, "%d requests" % sim.requests)
     check("the old pacing really did run into the limit all day", old_refused > 100,
           "%d refused" % old_refused)
     check("the new pacing is refused a handful of times a day at most", sim.refused <= 5,
@@ -768,18 +815,207 @@ def test_a_day():
 
 def test_flyout_key():
     print("the flyout's change detection")
-    u = app.Usage()
-    u.limits = [{"key": "session", "label": "Session (5h)", "percent": 20.0, "resets_at": None}]
-    u.updated = datetime.now()
-    a = app.Flyout.content_key(u)
-    check("the same data gives the same key", a == app.Flyout.content_key(u))
-    u.events = app.parse_events(REAL_GRANT)
-    check("a grant appearing changes it", a != app.Flyout.content_key(u))
+    h = Harness(providers=("claude", "ollama"))
+    h.usage.limits = [{"key": "session", "label": "Session (5h)", "percent": 20.0,
+                       "resets_at": None}]
+    h.usage.updated = datetime.now()
+    a = app.Flyout.content_key(h.active())
+    check("the same data gives the same key", a == app.Flyout.content_key(h.active()))
+    h.usage.events = app.parse_events(REAL_GRANT)
+    b = app.Flyout.content_key(h.active())
+    check("a grant appearing changes it", a != b)
+    h.ollama.usage.limits = [{"key": "monthly", "label": "Monthly credits", "percent": 5.0,
+                              "resets_at": None}]
+    check("so does the other provider's numbers", b != app.Flyout.content_key(h.active()))
+
+
+# --- Ollama -------------------------------------------------------------------------
+
+RFC_8032 = (   # (seed, public key, message, signature) - RFC 8032 section 7.1, tests 1 and 2
+    ("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+     "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", "",
+     "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
+     "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"),
+    ("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+     "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c", "72",
+     "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+     "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"),
+)
+
+
+def openssh_key(seed, cipher=b"none"):
+    """An OpenSSH private key file for `seed`, laid out the way ssh-keygen
+    (and so `ollama`) writes one."""
+    def string(b):
+        return struct.pack(">I", len(b)) + b
+    pub = app.ed25519_public(seed)
+    pub_blob = string(b"ssh-ed25519") + string(pub)
+    private = (struct.pack(">II", 0x5EED, 0x5EED) + string(b"ssh-ed25519") + string(pub)
+               + string(seed + pub) + string(b"friend@pc"))
+    private += bytes(range(1, 1 + (-len(private)) % 8))
+    raw = (b"openssh-key-v1\x00" + string(cipher) + string(b"none" if cipher == b"none" else b"bcrypt")
+           + string(b"") + struct.pack(">I", 1) + string(pub_blob) + string(private))
+    body = base64.b64encode(raw).decode()
+    lines = [body[i:i + 70] for i in range(0, len(body), 70)]
+    return ("-----BEGIN OPENSSH PRIVATE KEY-----\n" + "\n".join(lines)
+            + "\n-----END OPENSSH PRIVATE KEY-----\n"), pub_blob
+
+
+class FakeResponse(object):
+    def __init__(self, status, body):
+        self.status_code, self._body = status, body
+
+    def json(self):
+        return self._body
+
+
+def test_ollama():
+    print("signing like the ollama CLI")
+    for seed, pub, msg, sig in RFC_8032:
+        s_ = bytes.fromhex(seed)
+        check("Ed25519 matches RFC 8032 for seed %s..." % seed[:8],
+              app.ed25519_public(s_).hex() == pub
+              and app.ed25519_sign(s_, bytes.fromhex(msg)).hex() == sig)
+    seed = bytes.fromhex(RFC_8032[0][0])
+    text, pub_blob = openssh_key(seed)
+    got_seed, got_blob = app.read_openssh_ed25519(text)
+    check("the private key file is read back to its seed and public key",
+          got_seed == seed and got_blob == pub_blob)
+    header = app.ollama_signature(text, "GET", "/api/usage?ts=1790000000")
+    want = "%s:%s" % (base64.b64encode(pub_blob).decode(), base64.b64encode(
+        app.ed25519_sign(seed, b"GET,/api/usage?ts=1790000000")).decode())
+    check("the header is <public key>:<signature of METHOD,URI>", header == want)
+    try:
+        app.read_openssh_ed25519(openssh_key(seed, cipher=b"aes256-ctr")[0])
+        check("a passphrase-protected key is refused", False)
+    except ValueError:
+        check("a passphrase-protected key is refused", True)
+
+    print("reading /api/usage")
+    tz = datetime(2026, 9, 23, 12, 0).astimezone().tzinfo
+    now = datetime(2026, 9, 23, 12, 0, tzinfo=tz)
+    limits, spend = app.parse_ollama_usage(
+        {"limits": {"monthly": {"usage": 0.053, "models": [{"name": "glm", "request_count": 9}]}},
+         "activity": {"cost": "0.00000", "period": {"type": "last_4_weeks"}}}, None, now)
+    check("a monthly plan: one meter, as a percentage",
+          [(l["key"], l["label"], round(l["percent"], 1)) for l in limits]
+          == [("monthly", "Monthly credits", 5.3)], repr(limits))
+    check("no reset date without reset_day, and no spend when it is $0",
+          limits[0]["resets_at"] is None and spend is None)
+    limits, spend = app.parse_ollama_usage(
+        {"limits": {"weekly": {"usage": 0.316}, "session": {"usage": "0.349"},
+                    "daily": {"usage": 0.5}, "broken": {"usage": "lots"}},
+         "activity": {"cost": "1.68054"}}, None, now)
+    check("an older plan: session and weekly, in that order, plus anything new",
+          [l["key"] for l in limits] == ["session", "weekly", "daily"], repr(limits))
+    check("pay-as-you-go spend is kept", spend == {"cost": 1.68054}, repr(spend))
+    try:
+        app.parse_ollama_usage({"error": "nope"})
+        check("a response without limits is an error, not an empty meter", False)
+    except ValueError:
+        check("a response without limits is an error, not an empty meter", True)
+
+    print("when the monthly credits renew")
+    for day, at, want in ((14, now, "2026-10-14"), (23, now, "2026-10-23"), (24, now, "2026-09-24"),
+                          (31, datetime(2026, 2, 3, tzinfo=tz), "2026-02-28"),
+                          (5, datetime(2026, 12, 20, tzinfo=tz), "2027-01-05")):
+        got = app.next_monthly_reset(day, at)
+        check("reset_day %d on %s -> %s" % (day, at.date(), want),
+              bool(got) and got.startswith(want), repr(got))
+    check("no reset_day, no date", app.next_monthly_reset(None) is None
+          and app.next_monthly_reset("x") is None and app.next_monthly_reset(40) is None)
+
+    print("asking ollama.com")
+    home = tempfile.mkdtemp()
+    key_path = os.path.join(home, "id_ed25519")
+    with open(key_path, "w", encoding="ascii") as fh:
+        fh.write(text)
+    calls, answer = [], [FakeResponse(200, {"limits": {"monthly": {"usage": 0.25}}})]
+
+    def fake_get(url, headers=None, timeout=None, params=None):
+        calls.append((url, dict(headers or {})))
+        return answer[0]
+
+    saved = (app.requests.get, app.OLLAMA_KEY_PATH, os.environ.pop("OLLAMA_API_KEY", None))
+    app.requests.get, app.OLLAMA_KEY_PATH = fake_get, key_path
+    try:
+        u = app.fetch_ollama_usage({})
+        url, headers = calls[-1]
+        uri = url[len(app.OLLAMA_URL):]
+        check("without an API key the request is signed with the ollama signin key",
+              uri.startswith("/api/usage?ts=")
+              and headers.get("Authorization") == app.ollama_signature(text, "GET", uri), url)
+        check("and the answer becomes a 25% monthly meter",
+              u.error is None and [round(l["percent"]) for l in u.limits] == [25])
+        u = app.fetch_ollama_usage({"api_key": " secret "})
+        url, headers = calls[-1]
+        check("an API key is sent as a Bearer token instead",
+              url == app.OLLAMA_URL + "/api/usage" and headers.get("Authorization") == "Bearer secret")
+        answer[0] = FakeResponse(401, {"error": "invalid credentials"})
+        check("401 without a key: signed out", app.fetch_ollama_usage({}).error
+              == "Signed out - run ollama signin")
+        check("401 with a key: the key", app.fetch_ollama_usage({"api_key": "k"}).error
+              == "Ollama API key refused")
+        answer[0] = FakeResponse(429, {})
+        check("429 is a rate limit", app.fetch_ollama_usage({}).status == 429)
+        app.OLLAMA_KEY_PATH = os.path.join(home, "missing")
+        check("no key file and no API key: not signed in",
+              app.fetch_ollama_usage({}).error == "Not signed in to Ollama")
+    finally:
+        app.requests.get, app.OLLAMA_KEY_PATH = saved[0], saved[1]
+        if saved[2] is not None:
+            os.environ["OLLAMA_API_KEY"] = saved[2]
+
+    print("Ollama in the app")
+    h = Harness(providers=("claude", "ollama"), metrics=("session",))
+    check("its own, gentler pace", h.ollama.base_interval() == 300)
+    check("its own files", h.ollama.cache_path.endswith(".usage_cache.ollama.json")
+          and h.claude.cache_path.endswith(".usage_cache.json"))
+    h.set(session=(30, S1, "Session (5h)"))
+    h.ollama.usage.limits = [{"key": "monthly", "label": "Monthly credits", "percent": 81.0,
+                              "resets_at": None}]
+    h.check_notifications()
+    check("its limits are announced under its own name",
+          titles(h) == ["Ollama usage 81%"] and "Ollama monthly at 81%" in h.sent[0][1],
+          repr(h.sent))
+    h.set(session=(100, S1, "Session (5h)"))
+    h.ollama.usage.limits[0]["percent"] = 100.0
+    h.check_notifications()
+    check("both running out on one poll share a toast",
+          len(h.sent) == 2 and "Session (5h) limit reached" in h.sent[1][1]
+          and "Ollama monthly limit reached" in h.sent[1][1], repr(h.sent[1:]))
+    check("kept apart in the state", "session" in h.last_notified
+          and "ollama:monthly" in h.last_notified, repr(sorted(h.last_notified)))
+    h.cfg["notifications"]["signed_out_after"] = 0
+    h.ollama.usage.error = "Signed out - run ollama signin"
+    h.check_notifications()
+    check("its sign-in trouble gets its own nudge",
+          titles(h)[-1] == "Ollama usage is not updating" and "ollama signin" in h.sent[-1][1],
+          repr(h.sent[-1:]))
+
+    print("switching providers")
+    check("by default only Claude", app.enabled_providers(app.DEFAULT_CONFIG) == ["claude"])
+    check("never none", app.enabled_providers({"providers": {"claude": {"enabled": False}}})
+          == ["claude"])
+    with open(app.CONFIG_PATH, "w", encoding="utf-8") as fh:
+        json.dump({"refresh_seconds": 60, "providers": {"claude": {"enabled": True}}}, fh)
+    h = Harness()
+    h.cfg = app.load_config()
+    h.set_provider("ollama", True)
+    check("switching Ollama on saves it and starts it",
+          [s_.key for s_ in h.active()] == ["claude", "ollama"]
+          and json.load(open(app.CONFIG_PATH, encoding="utf-8"))["providers"]["ollama"]["enabled"])
+    h.set_provider("claude", False)
+    check("Claude can be switched off", [s_.key for s_ in h.active()] == ["ollama"])
+    h.set_provider("ollama", False)
+    check("but not the last one", [s_.key for s_ in h.active()] == ["ollama"])
+    saved_cfg = json.load(open(app.CONFIG_PATH, encoding="utf-8"))
+    check("and the rest of config.json is left alone", saved_cfg.get("refresh_seconds") == 60)
 
 
 def main():
     for test in (test_spam, test_coverage, test_delivery, test_events, test_parsing,
-                 test_event_poll, test_pacing, test_a_day, test_flyout_key):
+                 test_event_poll, test_pacing, test_a_day, test_flyout_key, test_ollama):
         test()
     print()
     if FAILURES:
