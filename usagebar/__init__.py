@@ -1,4 +1,5 @@
 """LLM Usage Bar: live usage of your LLM subscriptions on the Windows 11 taskbar."""
 
 
-VERSION = "1.2.1"
+APP_NAME = "LLM Usage Bar"
+VERSION = "2.0.0"

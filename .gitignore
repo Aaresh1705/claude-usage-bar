@@ -1,10 +1,10 @@
 .icons/
 __pycache__/
 *.pyc
+llm_usage_bar.log
+llm_usage_bar.crash.log
+# the names from before the rename
 claude_usage_bar.log
-widget/ClaudeUsageWidget/bin/
-widget/ClaudeUsageWidget/obj/
-widget/package/ClaudeUsageWidget/
 *.msix
 .usage_cache*.json
 config.json

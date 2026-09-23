@@ -1,21 +1,28 @@
-# Installs Claude Usage Bar: starts it now and every time you sign in.
+# Installs LLM Usage Bar: starts it now and every time you sign in.
 #
 #   powershell -ExecutionPolicy Bypass -File install.ps1              install + start
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -Update      git pull, then restart
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall   stop + remove (keeps config.json)
 #
 # It works either way round: in a clone it runs the Python source with pythonw,
-# and where only ClaudeUsageBar.exe was copied it uses that. Add -Exe to prefer
+# and where only LLMUsageBar.exe was copied it uses that. Add -Exe to prefer
 # the exe even in a clone.
+#
+# The app used to be called Claude Usage Bar. Installing over that version
+# replaces its startup task and shortcut with the new ones.
 
 param([switch]$Uninstall, [switch]$Update, [switch]$NoStart, [switch]$Exe, [switch]$UseStartupFolder)
 
 $ErrorActionPreference = 'Stop'
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$lnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Claude Usage Bar.lnk'
-$taskName = 'Claude Usage Bar'
-$source = Join-Path $dir 'claude_usage_bar.pyw'
-$icon = Join-Path $dir 'assets\ClaudeUsageBar.ico'
+$startup = [Environment]::GetFolderPath('Startup')
+$lnk = Join-Path $startup 'LLM Usage Bar.lnk'
+$taskName = 'LLM Usage Bar'
+$source = Join-Path $dir 'llm_usage_bar.pyw'
+$icon = Join-Path $dir 'assets\LLMUsageBar.ico'
+# what the version before the rename installed
+$legacyLnk = Join-Path $startup 'Claude Usage Bar.lnk'
+$legacyTask = 'Claude Usage Bar'
 
 # The source wins when it is there: a clone is meant to run from source, and on
 # a machine with Windows Defender Application Control enforced an unsigned exe
@@ -24,26 +31,30 @@ $icon = Join-Path $dir 'assets\ClaudeUsageBar.ico'
 # case-insensitive, so $exe and the -Exe switch would be the same variable.)
 $exePath = $null
 if ($Exe -or -not (Test-Path $source)) {
-    $exePath = @((Join-Path $dir 'ClaudeUsageBar.exe'), (Join-Path $dir 'dist\ClaudeUsageBar.exe')) |
+    $exePath = @((Join-Path $dir 'LLMUsageBar.exe'), (Join-Path $dir 'dist\LLMUsageBar.exe'),
+                 (Join-Path $dir 'ClaudeUsageBar.exe')) |
            Where-Object { Test-Path $_ } | Select-Object -First 1
 }
 
 function Stop-App {
-    Get-CimInstance Win32_Process -Filter "Name='ClaudeUsageBar.exe'" -ErrorAction SilentlyContinue |
+    Get-CimInstance Win32_Process -Filter "Name='LLMUsageBar.exe' OR Name='ClaudeUsageBar.exe'" `
+        -ErrorAction SilentlyContinue |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*claude_usage_bar*' } |
+        Where-Object { $_.CommandLine -like '*llm_usage_bar*' -or $_.CommandLine -like '*claude_usage_bar*' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Milliseconds 400
 }
 
 if ($Uninstall) {
     Stop-App
-    if (Test-Path $lnk) { Remove-Item $lnk -Force }
-    if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    foreach ($l in @($lnk, $legacyLnk)) { if (Test-Path $l) { Remove-Item $l -Force } }
+    foreach ($t in @($taskName, $legacyTask)) {
+        if (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $t -Confirm:$false
+        }
     }
-    Write-Host 'Claude Usage Bar removed. config.json and your log were left alone.'
+    Write-Host 'LLM Usage Bar removed. config.json and your log were left alone.'
     return
 }
 
@@ -62,7 +73,7 @@ if ($exePath) {
     $arguments = ''
     Write-Host "Using $exePath"
 } else {
-    if (-not (Test-Path $source)) { throw "Neither ClaudeUsageBar.exe nor claude_usage_bar.pyw is in $dir." }
+    if (-not (Test-Path $source)) { throw "Neither LLMUsageBar.exe nor llm_usage_bar.pyw is in $dir." }
 
     $pythonw = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source
     if (-not $pythonw) {
@@ -73,7 +84,7 @@ if ($exePath) {
         throw @'
 Python 3 was not found. Either install it:
     winget install Python.Python.3.12
-or use the prebuilt ClaudeUsageBar.exe, which needs no Python.
+or use the prebuilt LLMUsageBar.exe, which needs no Python.
 '@
     }
 
@@ -103,7 +114,7 @@ function Install-Shortcut {
     $shortcut.Arguments = $arguments
     $shortcut.WorkingDirectory = $dir
     $shortcut.WindowStyle = 7
-    $shortcut.Description = 'Claude usage on the taskbar'
+    $shortcut.Description = 'LLM usage on the taskbar'
     if (Test-Path $icon) { $shortcut.IconLocation = $icon }
     $shortcut.Save()
     Write-Host "Starts with Windows (Startup folder): $lnk"
@@ -125,7 +136,7 @@ if (-not $UseStartupFolder) {
             -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
             -MultipleInstances IgnoreNew
         Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
-            -Settings $settings -Description 'Claude usage on the taskbar' -Force | Out-Null
+            -Settings $settings -Description 'LLM usage on the taskbar' -Force | Out-Null
         # One mechanism only: the app refuses to run twice anyway, but a stale
         # shortcut would keep starting the old location after a move.
         if (Test-Path $lnk) { Remove-Item $lnk -Force }
@@ -137,6 +148,13 @@ if (-not $UseStartupFolder) {
     }
 }
 if (-not $installed) { Install-Shortcut }
+
+# The version before the rename started through its own task or shortcut.
+if (Get-ScheduledTask -TaskName $legacyTask -ErrorAction SilentlyContinue) {
+    Unregister-ScheduledTask -TaskName $legacyTask -Confirm:$false
+    Write-Host "Removed the old '$legacyTask' task"
+}
+if (Test-Path $legacyLnk) { Remove-Item $legacyLnk -Force }
 
 Stop-App
 if (-not $NoStart) {
@@ -166,5 +184,6 @@ repository and run install.ps1 there without -Exe (Python is signed, so it runs)
     Write-Host ''
     Write-Host 'If the corner is occupied, turn the Widgets button off:'
     Write-Host '  Settings > Personalization > Taskbar > Widgets'
-    Write-Host 'You also need to be signed in to Claude Code on this PC (run: claude).'
+    Write-Host 'It shows Claude usage when Claude Code is signed in on this PC (run: claude).'
+    Write-Host 'For Ollama cloud usage, right click it and tick Show Ollama usage.'
 }

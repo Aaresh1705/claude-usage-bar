@@ -45,7 +45,7 @@ class TaskbarWidget(object):
     composited update.
     """
 
-    CLASS_NAME = "ClaudeUsageOverlayWnd"
+    CLASS_NAME = "LLMUsageOverlayWnd"
     _atom = None
     _proc = None                      # one WNDPROC for the class, kept alive here
     _windows = {}                     # hwnd -> instance, so the proc can dispatch
@@ -103,7 +103,7 @@ class TaskbarWidget(object):
 
         hwnd = user32.CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            self.CLASS_NAME, "Claude usage", WS_POPUP, 0, 0, 10, 10,
+            self.CLASS_NAME, "LLM usage", WS_POPUP, 0, 0, 10, 10,
             None, None, kernel32.GetModuleHandleW(None), None)
         if not hwnd:
             log("overlay window creation failed: %s" % ctypes.get_last_error())

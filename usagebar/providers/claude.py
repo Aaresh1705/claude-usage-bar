@@ -58,7 +58,7 @@ def fetch_usage(with_events=False):
                 "Authorization": "Bearer " + token,
                 "anthropic-beta": "oauth-2025-04-20",
                 "Content-Type": "application/json",
-                "User-Agent": claude_code_user_agent() if with_events else "claude-usage-bar/" + VERSION,
+                "User-Agent": claude_code_user_agent() if with_events else "llm-usage-bar/" + VERSION,
             },
             timeout=20,
         )
@@ -290,18 +290,23 @@ class ClaudeSource(Source):
     def fetch(self, events):
         return fetch_usage(events)
 
+    def setting(self, key, default):
+        """providers.claude.<key>, or the old top-level key (load_config moves
+        a user's top-level one in; this covers a config built by hand)."""
+        return self.settings().get(key, self.cfg.get(key, default))
+
     def configured_interval(self):
-        return self.cfg.get("refresh_seconds", POLL_MIN_SECONDS)
+        return self.setting("refresh_seconds", POLL_MIN_SECONDS)
 
     def usage_page(self):
-        return self.cfg.get("usage_page_url") or "https://claude.ai/settings/usage"
+        return self.setting("usage_page_url", None) or USAGE_PAGE
 
     def metric(self):
         return ((self.cfg.get("taskbar_widget") or {}).get("metric")
                 or self.cfg.get("primary_metric") or "session")
 
     def events_enabled(self):
-        return bool(self.cfg.get("check_events", True))
+        return bool(self.setting("check_events", True))
 
     def wants_events(self, manual):
         # Refresh re-checks events too, so a reset you have just used stops

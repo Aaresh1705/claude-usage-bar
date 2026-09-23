@@ -8,7 +8,6 @@ from .util import deep_merge, log
 
 
 DEFAULT_CONFIG = {
-    "refresh_seconds": 120,
     "primary_metric": "session",
     "secondary_metric": "weekly_all",
     "icon": {
@@ -45,10 +44,6 @@ DEFAULT_CONFIG = {
     "tooltip_template": "Claude \u00b7 {primary_label}: {primary}%\n{secondary_label}: {secondary}%\nResets {primary_reset_short} (in {primary_reset_in})",
     "notifications": {"enabled": True, "at": [80, 95, 100],
                       "metrics": ["session", "weekly_all", "weekly_scoped"]},
-    # Ask the usage endpoint for promotional grants once an hour. The endpoint
-    # only answers Claude Code, so that one request uses Claude Code's user
-    # agent; set this to false to never do that.
-    "check_events": True,
     "flyout": {
         "width": 320,
         "theme": "auto",
@@ -78,10 +73,17 @@ DEFAULT_CONFIG = {
         "supersample": 3,
     },
     "left_click": "flyout",
-    "usage_page_url": "https://claude.ai/settings/usage",
     # Which usage to show. Switch them from the right-click menu, or here.
     "providers": {
-        "claude": {"enabled": True},
+        "claude": {
+            "enabled": True,
+            "refresh_seconds": 120,
+            "usage_page_url": "https://claude.ai/settings/usage",
+            # Ask for promotional grants once an hour. The endpoint only
+            # answers Claude Code, so that one request uses Claude Code's user
+            # agent; false never does that.
+            "check_events": True,
+        },
         "ollama": {
             "enabled": False,
             "api_key": "",          # optional; `ollama signin` is used when empty
@@ -91,6 +93,10 @@ DEFAULT_CONFIG = {
         },
     },
 }
+
+
+# Settings that belong to Claude, and were top-level before there were others.
+CLAUDE_KEYS = ("refresh_seconds", "check_events", "usage_page_url")
 
 
 def load_config():
@@ -105,6 +111,16 @@ def load_config():
             n = user.get("notifications") if isinstance(user, dict) else None
             if isinstance(n, dict) and "metric" in n and "metrics" not in n:
                 cfg["notifications"] = dict(cfg["notifications"], metrics=[n["metric"]])
+            # Claude's own settings used to sit at the top level; a value set
+            # there still counts, unless providers.claude sets it too.
+            claude = ((user.get("providers") or {}).get("claude") or {}) \
+                if isinstance(user, dict) else {}
+            moved = {k: user[k] for k in CLAUDE_KEYS
+                     if isinstance(user, dict) and k in user and k not in claude}
+            if moved:
+                providers = dict(cfg["providers"])
+                providers["claude"] = dict(providers["claude"], **moved)
+                cfg["providers"] = providers
         else:
             with open(paths.CONFIG_PATH, "w", encoding="utf-8") as fh:
                 json.dump(DEFAULT_CONFIG, fh, indent=2)

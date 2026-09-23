@@ -1,7 +1,7 @@
 """Renders the app icon (used for the .exe and the Startup shortcut).
 
-The same language as the widget: a Claude-orange tile with a usage pill across
-it, and the skull that the widget shows at 100%.
+The same language as the widget: an indigo tile with a usage pill across it,
+and the skull that the widget shows at 100%.
 """
 
 import os
@@ -10,8 +10,8 @@ import sys
 from PIL import Image, ImageDraw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, "assets", "ClaudeUsageBar.ico")
-ORANGE = (201, 100, 66, 255)
+OUT = os.path.join(HERE, "assets", "LLMUsageBar.ico")
+TILE = (79, 70, 229, 255)
 INK = (240, 238, 235, 255)
 
 
@@ -53,7 +53,7 @@ def tile(size):
     s = size * ss
     img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle((0, 0, s - 1, s - 1), radius=int(s * 0.22), fill=ORANGE)
+    d.rounded_rectangle((0, 0, s - 1, s - 1), radius=int(s * 0.22), fill=TILE)
 
     pad, bar_h = s * 0.16, s * 0.17
     top = s * 0.66

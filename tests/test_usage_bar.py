@@ -1,6 +1,7 @@
-"""Notification and event behaviour, driven through the real TrayApp methods.
+"""LLM Usage Bar's behaviour, driven through the real code: notifications,
+events, pacing, providers, and moving over from the old name.
 
-Run:  python tests/test_notifications.py
+Run:  python tests/test_usage_bar.py
 
 The reset timestamps here are shaped like the real API's: the same reset
 instant comes back with different microseconds on every request, e.g.
@@ -61,7 +62,7 @@ app = Modules([paths, util, deps, config, usage, source, claude, ollama, provide
 # Everything the app would write - its log, the usage cache, the notification
 # state, the config - goes to a scratch directory. Without this the tests wrote
 # into the real app's files, and the running widget picked up a made-up event.
-_SANDBOX = tempfile.mkdtemp(prefix="claude-usage-bar-tests-")
+_SANDBOX = tempfile.mkdtemp(prefix="llm-usage-bar-tests-")
 for _name in ("LOG_PATH", "FALLBACK_LOG", "USAGE_CACHE", "NOTIFY_STATE", "POLL_STATE",
               "CONFIG_PATH", "CRASH_LOG"):
     setattr(app, _name, os.path.join(_SANDBOX, os.path.basename(getattr(app, _name))))
@@ -1073,10 +1074,62 @@ def test_window_procedures():
           repr(c.ran))
 
 
+def test_rename():
+    print("config.json from before providers had their own settings")
+    for user, want in (
+            ({"refresh_seconds": 60, "check_events": False, "usage_page_url": "https://x"},
+             (60, False, "https://x")),
+            ({"refresh_seconds": 60, "providers": {"claude": {"refresh_seconds": 300}}},
+             (300, True, "https://claude.ai/settings/usage")),
+            ({}, (120, True, "https://claude.ai/settings/usage"))):
+        with open(app.CONFIG_PATH, "w", encoding="utf-8") as fh:
+            json.dump(user, fh)
+        c = app.load_config()["providers"]["claude"]
+        got = (c.get("refresh_seconds"), c.get("check_events"), c.get("usage_page_url"))
+        check("%s -> %r" % (json.dumps(user)[:60], want), got == want, repr(got))
+    check("the defaults keep no Claude settings at the top level",
+          not any(k in app.DEFAULT_CONFIG for k in ("refresh_seconds", "check_events",
+                                                     "usage_page_url")))
+    h = Harness()
+    h.cfg = {"refresh_seconds": 600, "check_events": False, "providers": {"claude": {}}}
+    check("and a config built by hand with the old keys still works",
+          h.claude.base_interval() == 600 and not h.claude.events_enabled())
+
+    print("an install from when it was called Claude Usage Bar")
+    data, local = tempfile.mkdtemp(), tempfile.mkdtemp()
+    saved = {k: getattr(app, k) for k in ("DATA_DIR", "LOG_PATH", "CRASH_LOG", "LOCAL")}
+    try:
+        app.DATA_DIR, app.LOCAL = data, local
+        app.LOG_PATH = os.path.join(data, "llm_usage_bar.log")
+        app.CRASH_LOG = os.path.join(data, "llm_usage_bar.crash.log")
+        with open(os.path.join(data, "claude_usage_bar.log"), "w") as fh:
+            fh.write("old history\n")
+        open(app.LOG_PATH, "w").close()                 # an empty one, as a first run makes
+        os.makedirs(os.path.join(local, "claude-usage-bar"))
+        with open(os.path.join(local, "claude-usage-bar", "config.json"), "w") as fh:
+            fh.write("{}")
+        os.makedirs(os.path.join(local, "llm-usage-bar"))  # created empty on import
+        moved = app.migrate_legacy_files()
+        check("the log keeps its history under the new name",
+              open(app.LOG_PATH).read() == "old history\n"
+              and not os.path.exists(os.path.join(data, "claude_usage_bar.log")), repr(moved))
+        check("the per-user folder is carried over",
+              os.path.exists(os.path.join(local, "llm-usage-bar", "config.json"))
+              and not os.path.exists(os.path.join(local, "claude-usage-bar")))
+        with open(os.path.join(data, "claude_usage_bar.log"), "w") as fh:
+            fh.write("an old copy still writing\n")
+        app.migrate_legacy_files()
+        check("but never over a log the new name already has",
+              open(app.LOG_PATH).read() == "old history\n")
+    finally:
+        for k, v in saved.items():
+            setattr(app, k, v)
+
+
 def main():
     for test in (test_spam, test_coverage, test_delivery, test_events, test_parsing,
                  test_event_poll, test_pacing, test_a_day, test_flyout_key, test_ollama,
-                 test_window_procedures):
+                 test_window_procedures, test_rename):
         test()
     print()
     if FAILURES:

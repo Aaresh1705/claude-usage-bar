@@ -1,11 +1,11 @@
-# Builds dist\ClaudeUsageBar.exe - a single file that needs no Python on the
+# Builds dist\LLMUsageBar.exe - a single file that needs no Python on the
 # machine it runs on.
 #
 #   powershell -ExecutionPolicy Bypass -File build.ps1
 #
 # The exe keeps config.json, the log and the cache beside itself, so put it in a
 # folder of its own (Documents, not Program Files) or it will fall back to
-# %LOCALAPPDATA%\claude-usage-bar.
+# %LOCALAPPDATA%\llm-usage-bar.
 
 param([switch]$KeepBuildDir)
 
@@ -37,22 +37,22 @@ $args = @(
     '--noconfirm',
     '--onefile',
     '--windowed',                      # no console window
-    '--name', 'ClaudeUsageBar',
-    '--icon', (Join-Path $dir 'assets\ClaudeUsageBar.ico'),
+    '--name', 'LLMUsageBar',
+    '--icon', (Join-Path $dir 'assets\LLMUsageBar.ico'),
     '--exclude-module', 'numpy',       # Pillow pulls these in if present
     '--exclude-module', 'scipy',
     '--exclude-module', 'matplotlib',
-    (Join-Path $dir 'claude_usage_bar.pyw')
+    (Join-Path $dir 'llm_usage_bar.pyw')
 )
 & $python @args
 if ($LASTEXITCODE -ne 0) { throw 'PyInstaller failed.' }
 
 if (-not $KeepBuildDir) {
     Remove-Item (Join-Path $dir 'build') -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item (Join-Path $dir 'ClaudeUsageBar.spec') -Force -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $dir 'LLMUsageBar.spec') -Force -ErrorAction SilentlyContinue
 }
 
-$exe = Join-Path $dir 'dist\ClaudeUsageBar.exe'
+$exe = Join-Path $dir 'dist\LLMUsageBar.exe'
 $size = [math]::Round((Get-Item $exe).Length / 1MB, 1)
 Write-Host ''
 Write-Host "Built $exe  ($size MB)"

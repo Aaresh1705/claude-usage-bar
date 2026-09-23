@@ -1,14 +1,12 @@
-"""Claude usage bar - live usage on the Windows 11 taskbar.
+"""The app's old name, kept so installs from before the rename keep working.
 
-The app is the usagebar package beside this file; this is the script the
-startup task runs. Run it with pythonw.exe (no console).
+Their startup task, and the install.ps1 -Update they run, still start this
+file. Running install.ps1 once moves the task over to llm_usage_bar.pyw, after
+which nothing starts this file any more.
 """
 
 import os
-import sys
+import runpy
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from usagebar.app import run  # noqa: E402
-
-run()
+runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_usage_bar.pyw"),
+               run_name="__main__")

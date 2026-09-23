@@ -208,7 +208,7 @@ def fetch_ollama_usage(settings):
     api_key = str(settings.get("api_key") or os.environ.get("OLLAMA_API_KEY") or "").strip()
     path = "/api/usage"
     try:
-        headers = {"Accept": "application/json", "User-Agent": "claude-usage-bar/" + VERSION}
+        headers = {"Accept": "application/json", "User-Agent": "llm-usage-bar/" + VERSION}
         if api_key:
             uri = path
             headers["Authorization"] = "Bearer " + api_key

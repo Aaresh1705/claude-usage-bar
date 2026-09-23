@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 from . import deps, paths
 from . import tkui
-from . import VERSION
+from . import APP_NAME, VERSION
 from .config import load_config
 from .flyout import Flyout
 from .providers import SOURCES, enabled_providers
@@ -34,7 +34,7 @@ CMD_PROVIDER = 20                       # + index into SOURCES
 
 def startup_lnk_path():
     return os.path.join(os.environ["APPDATA"], "Microsoft", "Windows", "Start Menu",
-                        "Programs", "Startup", "Claude Usage Bar.lnk")
+                        "Programs", "Startup", "LLM Usage Bar.lnk")
 
 
 def toggle_startup():
@@ -45,11 +45,11 @@ def toggle_startup():
     pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
     if not os.path.exists(pyw):
         pyw = sys.executable
-    script = os.path.join(paths.APP_DIR, "claude_usage_bar.pyw")
+    script = os.path.join(paths.APP_DIR, "llm_usage_bar.pyw")
     ps = (
         "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('%s');"
         "$s.TargetPath='%s';$s.Arguments='\"%s\"';$s.WorkingDirectory='%s';"
-        "$s.WindowStyle=7;$s.Description='Claude usage bar';$s.Save()"
+        "$s.WindowStyle=7;$s.Description='LLM usage on the taskbar';$s.Save()"
         % (lnk, pyw, script, paths.APP_DIR)
     )
     subprocess.run(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
@@ -84,10 +84,10 @@ class TrayApp(object):
         wc = WNDCLASS()
         wc.lpfnWndProc = self.wndproc
         wc.hInstance = self.hinst
-        wc.lpszClassName = "ClaudeUsageBarWnd"
+        wc.lpszClassName = "LLMUsageBarWnd"
         self.atom = user32.RegisterClassW(ctypes.byref(wc))
         self.wm_taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")
-        self.hwnd = user32.CreateWindowExW(0, "ClaudeUsageBarWnd", "Claude Usage Bar",
+        self.hwnd = user32.CreateWindowExW(0, "LLMUsageBarWnd", APP_NAME,
                                            0, 0, 0, 0, 0, None, None, self.hinst, None)
         # Told when the session locks and unlocks: nobody reads a locked screen,
         # so polling pauses until you are back.
@@ -326,7 +326,7 @@ class TrayApp(object):
                 os.startfile(paths.LOG_PATH)
         elif cmd == CMD_STARTUP:
             on = toggle_startup()
-            self.notify("Claude usage bar", "Start with Windows: %s" % ("on" if on else "off"))
+            self.notify(APP_NAME, "Start with Windows: %s" % ("on" if on else "off"))
         elif cmd == CMD_QUIT:
             self.quit()
 
@@ -493,7 +493,7 @@ class TrayApp(object):
             if len(due) == 1:
                 title, body = due[0][2], due[0][3]
             else:
-                title = "Claude usage"
+                title = "LLM usage"
                 body = "\n".join(alert[4] for alert in due)
             # Only count it as announced if it was actually shown: a toast held
             # back because you are in a game or a video is tried again next
@@ -659,7 +659,7 @@ class TrayApp(object):
 # Main loop: tkinter drives, Win32 messages are pumped from it
 # ---------------------------------------------------------------------------
 
-_instance_mutex = None
+_instance_mutexes = []
 _crash_file = None
 
 
@@ -693,17 +693,23 @@ def single_instance():
     privilege we may not have) and ERROR_ALREADY_EXISTS is only believed when a
     real instance window answers - otherwise a stale handle could keep the app
     from ever starting again.
+
+    The old name's lock is held as well: a copy from before the rename (when
+    this was Claude Usage Bar) must not run next to this one, whichever of
+    the two starts first.
     """
-    global _instance_mutex
-    ctypes.set_last_error(0)
-    _instance_mutex = kernel32.CreateMutexW(None, True, "Local\\ClaudeUsageBarMutex")
-    if not _instance_mutex:
-        return True                      # can't tell; better to run than not to
-    if ctypes.get_last_error() != 183:   # ERROR_ALREADY_EXISTS: we created it
-        return True
-    # It already existed, so wait briefly for ownership rather than guessing
-    # from a window that the other instance may not have created yet.
-    return kernel32.WaitForSingleObject(_instance_mutex, 1500) in (0, 0x80)
+    for name in ("Local\\LLMUsageBarMutex", "Local\\ClaudeUsageBarMutex"):
+        ctypes.set_last_error(0)
+        handle = kernel32.CreateMutexW(None, True, name)
+        if not handle:
+            continue                     # can't tell; better to run than not to
+        _instance_mutexes.append(handle)
+        # ERROR_ALREADY_EXISTS: another instance has it. Wait briefly for
+        # ownership rather than guessing from a window it may not have yet.
+        if ctypes.get_last_error() == 183 and \
+                kernel32.WaitForSingleObject(handle, 1500) not in (0, 0x80):
+            return False
+    return True
 
 
 def enable_crash_log():
@@ -719,7 +725,10 @@ def enable_crash_log():
 
 
 def main():
+    moved = paths.migrate_legacy_files()         # before the first log line
     log("starting v%s (pid %d, %s)" % (VERSION, os.getpid(), sys.executable))
+    if moved:
+        log("renamed from Claude Usage Bar: moved %s" % ", ".join(moved))
     enable_crash_log()
     if not single_instance():
         log("another instance is running; exiting")
