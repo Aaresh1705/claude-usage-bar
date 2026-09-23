@@ -1,11 +1,10 @@
 """Renders preview.png: the widget in every state it has, on both themes.
 
-Unlike make_icon.py this one drives the real renderer - it loads the app as a
-module and calls TaskbarWidget._render, so the picture in the README cannot
+Unlike make_icon.py this one drives the real renderer - it imports the app's
+package and calls TaskbarWidget._render, so the picture in the README cannot
 drift away from what the taskbar actually shows.
 """
 
-import importlib.util
 import os
 import sys
 import types
@@ -27,20 +26,17 @@ STATES = [(14, 92, None), (72, 41, None), (96, 17, None), (100, 12, None),
 
 
 def load_app():
-    """The app is a .pyw, so it cannot simply be imported by name."""
-    spec = importlib.util.spec_from_file_location(
-        "claude_usage_bar", os.path.join(HERE, "claude_usage_bar.pyw"))
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    if not module.import_dependencies():
+    sys.path.insert(0, HERE)
+    from usagebar import config, deps, widget
+    if not deps.OK:
         raise SystemExit("Pillow / requests are missing")
-    return module
+    return types.SimpleNamespace(load_config=config.load_config, Image=deps.Image,
+                                 TaskbarWidget=widget.TaskbarWidget, widget_module=widget)
 
 
 def widget(app, cfg, light):
     """A TaskbarWidget with just enough around it to draw with."""
-    app.windows_uses_light_theme = lambda: light
+    app.widget_module.windows_uses_light_theme = lambda: light
     obj = app.TaskbarWidget.__new__(app.TaskbarWidget)
     obj.app = types.SimpleNamespace(cfg=cfg)
     return obj

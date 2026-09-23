@@ -9,39 +9,61 @@ instant comes back with different microseconds on every request, e.g.
 
 import base64
 import copy
-import importlib.util
 import itertools
 import json
 import os
 import struct
 import sys
 import tempfile
-import threading
 import time
 import types
 from datetime import datetime, timedelta
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-APP = os.path.join(os.path.dirname(HERE), "claude_usage_bar.pyw")
+sys.path.insert(0, os.path.dirname(HERE))
+
+from usagebar import deps  # noqa: E402 - loads requests and Pillow
+import usagebar  # noqa: E402
+from usagebar import (app as _app, config, flyout, paths, render, source, tkui,  # noqa: E402
+                      toast, usage, util, widget, win32)
+from usagebar import providers  # noqa: E402
+from usagebar.providers import claude, ollama  # noqa: E402
+
+if not deps.OK:
+    raise SystemExit("Pillow / requests are missing")
 
 
-def load_app():
-    spec = importlib.util.spec_from_file_location("claude_usage_bar_under_test", APP)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    if not module.import_dependencies():
-        raise SystemExit("Pillow / requests are missing")
-    return module
+class Modules(object):
+    """All of the app's modules as one namespace. Reading a name finds it in
+    whichever module has it; assigning one - to patch it - rebinds it in every
+    module that holds the same object, since that is where the code looks it
+    up (a function imported into three modules is patched in all three)."""
+
+    def __init__(self, modules):
+        object.__setattr__(self, "_modules", modules)
+
+    def __getattr__(self, name):
+        for module in self._modules:
+            if hasattr(module, name):
+                return getattr(module, name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        old = getattr(self, name)
+        for module in self._modules:
+            if vars(module).get(name, object()) is old:
+                setattr(module, name, value)
 
 
-app = load_app()
+app = Modules([paths, util, deps, config, usage, source, claude, ollama, providers, render,
+               win32, tkui, widget, flyout, toast, _app, usagebar])
 
 # Everything the app would write - its log, the usage cache, the notification
 # state, the config - goes to a scratch directory. Without this the tests wrote
 # into the real app's files, and the running widget picked up a made-up event.
 _SANDBOX = tempfile.mkdtemp(prefix="claude-usage-bar-tests-")
 for _name in ("LOG_PATH", "FALLBACK_LOG", "USAGE_CACHE", "NOTIFY_STATE", "POLL_STATE",
-              "CONFIG_PATH"):
+              "CONFIG_PATH", "CRASH_LOG"):
     setattr(app, _name, os.path.join(_SANDBOX, os.path.basename(getattr(app, _name))))
 
 _micro = itertools.count(100000, 7919)
