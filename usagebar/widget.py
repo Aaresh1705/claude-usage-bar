@@ -133,7 +133,7 @@ class TaskbarWidget(object):
             self.app.defer(self.app.left_click)
             return 0
         if msg == WM_RBUTTONUP:
-            self.app.defer(self.app.show_menu)
+            self.app.request_menu()
             return 0
         if msg in (WM_DISPLAYCHANGE, WM_SETTINGCHANGE, WM_DPICHANGED, WM_THEMECHANGED):
             self.geometry = None      # re-measure against the new taskbar/theme

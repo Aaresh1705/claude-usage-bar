@@ -1043,9 +1043,11 @@ def test_window_procedures():
         _wndproc = app.TrayApp._wndproc
         defer = app.TrayApp.defer
         run_deferred = app.TrayApp.run_deferred
+        request_menu = app.TrayApp.request_menu
 
         def __init__(self):
             self._deferred, self.ran = [], []
+            self._menu_state = None
             self.wm_taskbar_created = 0xC0DE
             self.cfg = {"left_click": "flyout"}
 
@@ -1054,6 +1056,7 @@ def test_window_procedures():
 
         def show_menu(self):
             self.ran.append(("menu",))
+            self._menu_state = None
 
         def left_click(self):
             self.ran.append(("left",))
@@ -1067,11 +1070,19 @@ def test_window_procedures():
     widget._on_message(app.WM_LBUTTONUP, 0, 0)
     widget._on_message(app.WM_RBUTTONUP, 0, 0)
     check("nothing runs inside the window procedure, where calling Tk aborts the process",
-          c.ran == [] and len(c._deferred) == 5, repr(c.ran))
+          c.ran == [] and len(c._deferred) == 4, repr(c.ran))
     c.run_deferred()
-    check("the pump then runs each, in order",
-          c.ran == [("command", app.CMD_PROVIDER + 1), ("left",), ("menu",), ("left",), ("menu",)],
+    check("the pump then runs them in order - two right clicks, one menu",
+          c.ran == [("command", app.CMD_PROVIDER + 1), ("left",), ("menu",), ("left",)],
           repr(c.ran))
+    for _ in range(3):
+        c._wndproc(None, app.WM_TRAY, 0, app.WM_RBUTTONUP)
+    c._menu_state = "open"
+    widget._on_message(app.WM_RBUTTONUP, 0, 0)
+    c._menu_state = None
+    c.run_deferred()
+    check("however many right clicks arrive while one is queued or open",
+          c.ran[4:] == [("menu",)], repr(c.ran[4:]))
 
 
 def test_rename():

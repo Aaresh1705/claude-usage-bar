@@ -30,6 +30,7 @@ from .win32 import IMAGE_ICON, LR_LOADFROMFILE, MF_CHECKED, MF_GRAYED, MF_SEPARA
 
 CMD_DETAILS, CMD_REFRESH, CMD_CONFIG, CMD_RELOAD, CMD_WEB, CMD_STARTUP, CMD_LOG, CMD_QUIT = range(1, 9)
 CMD_PROVIDER = 20                       # + index into SOURCES
+MENU_GRACE_SECONDS = 0.4                # a pick sooner than this is a stray click
 
 
 def startup_lnk_path():
@@ -73,6 +74,7 @@ class TrayApp(object):
         self.toast = None
         self.locked = False
         self._deferred = []              # clicks and commands, for the pump to run
+        self._menu_state = None          # None, "queued" or "open"
         self.sources = {}                # key -> Source, for the enabled ones
         self.sync_sources()
 
@@ -276,7 +278,22 @@ class TrayApp(object):
         self.registered = 0
 
     # -- menu --------------------------------------------------------------
+    def request_menu(self):
+        """A right click. One menu at a time: clicks while one is open or
+        already queued would otherwise stack up menus, each opening under the
+        pointer - where the next click lands on an item."""
+        if self._menu_state is None:
+            self._menu_state = "queued"
+            self.defer(self.show_menu)
+
     def show_menu(self):
+        self._menu_state = "open"
+        try:
+            self._show_menu()
+        finally:
+            self._menu_state = None
+
+    def _show_menu(self):
         menu = user32.CreatePopupMenu()
         user32.AppendMenuW(menu, MF_STRING, CMD_DETAILS, "Show details")
         user32.AppendMenuW(menu, MF_STRING, CMD_REFRESH, "Refresh now")
@@ -300,10 +317,17 @@ class TrayApp(object):
         pt = wt.POINT()
         user32.GetCursorPos(ctypes.byref(pt))
         user32.SetForegroundWindow(self.hwnd)
+        opened = time.time()
         cmd = user32.TrackPopupMenu(menu, TPM_RIGHTALIGN | TPM_BOTTOMALIGN | TPM_RETURNCMD | TPM_RIGHTBUTTON,
                                     pt.x, pt.y, 0, self.hwnd, None)
         user32.PostMessageW(self.hwnd, 0x0000, 0, 0)
         user32.DestroyMenu(menu)
+        # The menu opens with its corner under the pointer, on the last item
+        # (Quit). A choice within a moment of it opening is the second click of
+        # a double click landing there, not a decision - ignore it.
+        if cmd and time.time() - opened < MENU_GRACE_SECONDS:
+            log("ignored menu item %d picked %.2fs after the menu opened" % (cmd, time.time() - opened))
+            return
         if cmd:
             self.on_command(cmd)
 
@@ -366,7 +390,7 @@ class TrayApp(object):
             if event in (WM_LBUTTONUP, NIN_SELECT):
                 self.defer(self.left_click)
             elif event in (WM_RBUTTONUP, WM_CONTEXTMENU):
-                self.defer(self.show_menu)
+                self.request_menu()
             return 0
         if msg == WM_COMMAND:
             self.defer(self.on_command, wparam & 0xFFFF)
@@ -640,6 +664,7 @@ class TrayApp(object):
         self.flyout.show(self.active())
 
     def quit(self):
+        log("quit from the menu")
         if self.widget is not None:
             self.widget.destroy()
         if self.toast is not None:
@@ -778,6 +803,7 @@ def main():
           first_ms=300)
     every("clock", 30000, app.update_icon)
     tkui.root.mainloop()
+    log("main loop ended")
 
 
 def run():

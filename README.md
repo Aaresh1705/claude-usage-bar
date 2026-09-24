@@ -524,7 +524,7 @@ still track the `thresholds` you configure.
 * Only one instance runs: a per-session named mutex, which a second copy waits
   on briefly before giving up - so a leftover lock can't stop the app from
   starting again, and the version from before the rename can't run beside it.
-* Every launch writes a `starting v2.0.0 (pid …)` line to `llm_usage_bar.log`, so
+* Every launch writes a `starting v2.0.1 (pid …)` line to `llm_usage_bar.log`, so
   "it didn't come back after a reboot" is answerable. A line means it started -
   compare its timestamp with `(Get-CimInstance Win32_OperatingSystem).LastBootUpTime`
   to see how long the shell took to get to it. No line at all means Windows never
